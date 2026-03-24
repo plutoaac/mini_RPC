@@ -14,13 +14,16 @@
 - 阻塞式 TCP 通信
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
-- 错误码与错误信息回传
+- 基于 `std::error_code` 的统一错误体系
+- 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
+- 基于 `std::source_location` 的轻量结构化日志
 
 ## 2. 架构说明
 
 分层如下：
 - 协议层（`src/protocol`）：负责网络帧编解码，不关心业务类型
 - 序列化层（`proto`）：由 protobuf 定义通用 RPC 消息和业务消息
+- 公共基础层（`src/common`）：错误体系、fd RAII、日志设施
 - 框架层（`src/server`、`src/client`）：负责注册、分发、调用、错误处理
 - 业务层（`src/demo`）：`CalcService.Add` 示例
 
@@ -48,13 +51,26 @@
   - handler 接口：输入请求 `bytes`，输出响应 `bytes`
 
 - `src/server/rpc_server.*`
-  - TCP 监听/接收连接
+  - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
   - 解码请求、查找 handler、执行并返回响应
+  - 异常与错误统一映射到 `RpcResponse`
 
 - `src/client/rpc_client.*`
   - 连接服务端
   - 构造并发送 `RpcRequest`
   - 接收并解析 `RpcResponse`
+  - 通过 `Status(std::error_code + message)` 返回统一错误
+
+- `src/common/rpc_error.h`
+  - 定义框架错误枚举与 `std::error_code` category
+  - 提供 protobuf 错误码与框架错误码的双向转换
+
+- `src/common/unique_fd.h`
+  - 提供 move-only 的 fd RAII 包装，避免手动 `close` 泄漏
+
+- `src/common/log.h`
+  - 提供 `LogInfo/LogWarn/LogError`
+  - 自动附带 `file:line:function`（`std::source_location`）
 
 - `src/demo/server_main.cpp`
   - 注册 `CalcService.Add`
@@ -116,6 +132,20 @@ Add(1,2) = 3
 6. handler 解析业务 payload，执行加法，返回响应 payload
 7. 服务端构造 `RpcResponse`（含错误码/错误信息）并回写
 8. 客户端读取 `RpcResponse`，成功时解析 `calc::AddResponse` 得到结果
+
+## 7. 错误体系与日志
+
+### 统一错误体系
+
+- 业务层可抛出 `RpcException`
+- 框架层统一收敛为 `Status`（包含 `std::error_code` 与 message）
+- 网络层响应仍使用 `rpc.proto` 中的 `ErrorCode` 字段，保证协议稳定
+
+### 日志
+
+- 日志接口：`LogInfo/LogWarn/LogError`
+- 每条日志自动输出来源位置：文件名、行号、函数名
+- 适合后续替换为更完整的日志后端（如 spdlog / tracing）
 
 ## 可扩展性说明
 

@@ -10,14 +10,17 @@
 
 namespace rpc::client {
 
+// RPC 调用结果：统一携带状态和响应 payload。
 struct RpcCallResult {
-  rpc::common::Status status{rpc::common::ErrorCode::kInternalError,
-                             "uninitialized"};
+  rpc::common::Status status{
+      rpc::common::make_error_code(rpc::common::ErrorCode::kInternalError),
+      "uninitialized"};
   std::string response_payload;
 
   [[nodiscard]] bool ok() const noexcept { return status.ok(); }
 };
 
+// 阻塞式 RPC 客户端：维护单连接并提供通用 Call 接口。
 class RpcClient {
  public:
   RpcClient(std::string host, std::uint16_t port);
@@ -26,9 +29,9 @@ class RpcClient {
   [[nodiscard]] bool Connect();
   void Close();
 
-  // Generic RPC call (modern API):
-  // - request_payload: protobuf bytes of business request.
-  // - response_payload: protobuf bytes of business response in result.
+  // 通用 RPC 调用接口：
+  // - request_payload：业务请求 protobuf 序列化后的 bytes。
+  // - 返回值中 response_payload：业务响应 protobuf bytes。
   [[nodiscard]] RpcCallResult Call(std::string_view service_name,
                                    std::string_view method_name,
                                    std::string_view request_payload);

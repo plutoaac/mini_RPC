@@ -4,6 +4,7 @@
 
 namespace rpc::common {
 
+// POSIX 文件描述符的 RAII 封装：对象析构时自动 close，防止泄漏。
 class UniqueFd {
  public:
   constexpr UniqueFd() noexcept = default;
@@ -27,12 +28,14 @@ class UniqueFd {
   [[nodiscard]] bool Valid() const noexcept { return fd_ >= 0; }
   explicit operator bool() const noexcept { return Valid(); }
 
+  // 释放所有权但不关闭 fd，交给调用方后续管理。
   int Release() noexcept {
     const int old = fd_;
     fd_ = -1;
     return old;
   }
 
+  // 重置到新 fd；若当前 fd 有效会先执行 close。
   void Reset(int new_fd = -1) noexcept {
     if (fd_ >= 0) {
       ::close(fd_);

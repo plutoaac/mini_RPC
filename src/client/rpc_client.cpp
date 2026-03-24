@@ -6,10 +6,10 @@
 
 #include <cerrno>
 #include <cstring>
-#include <iostream>
 #include <string>
 #include <string_view>
 
+#include "common/log.h"
 #include "protocol/codec.h"
 
 namespace rpc::client {
@@ -21,13 +21,15 @@ RpcClient::~RpcClient() { Close(); }
 
 bool RpcClient::Connect() {
   if (sock_) {
+    // 已连接直接复用。
     return true;
   }
 
+  // 使用临时 RAII fd 承接连接过程，成功后再 move 到成员 sock_。
   common::UniqueFd conn_fd(::socket(AF_INET, SOCK_STREAM, 0));
   if (!conn_fd) {
-    std::cerr << "[ERROR] client socket failed: " << std::strerror(errno)
-              << '\n';
+    common::LogError(std::string("client socket failed: ") +
+                     std::strerror(errno));
     return false;
   }
 
@@ -35,20 +37,20 @@ bool RpcClient::Connect() {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port_);
   if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) <= 0) {
-    std::cerr << "[ERROR] invalid server address: " << host_ << '\n';
+    common::LogError("invalid server address: " + host_);
     Close();
     return false;
   }
 
   if (::connect(conn_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
                 sizeof(addr)) < 0) {
-    std::cerr << "[ERROR] connect failed: " << std::strerror(errno) << '\n';
+    common::LogError(std::string("connect failed: ") + std::strerror(errno));
     Close();
     return false;
   }
 
   sock_ = std::move(conn_fd);
-  std::cout << "[INFO] connected to " << host_ << ':' << port_ << '\n';
+  common::LogInfo("connected to " + host_ + ':' + std::to_string(port_));
   return true;
 }
 
@@ -62,11 +64,15 @@ std::string RpcClient::NextRequestId() {
 RpcCallResult RpcClient::Call(std::string_view service_name,
                               std::string_view method_name,
                               std::string_view request_payload) {
+  // 先确保连接可用。
   if (!Connect()) {
-    return RpcCallResult{{common::ErrorCode::kInternalError, "connect failed"},
-                         {}};
+    return RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "connect failed"},
+        {}};
   }
 
+  // 组装通用 RpcRequest，业务内容只作为 bytes 透传。
   rpc::RpcRequest request;
   request.set_request_id(NextRequestId());
   request.set_service_name(std::string(service_name));
@@ -74,27 +80,34 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
   request.set_payload(std::string(request_payload));
 
   std::string write_error;
+  // 发送请求帧。
   if (!protocol::Codec::WriteMessage(sock_.Get(), request, &write_error)) {
-    auto result = RpcCallResult{{common::ErrorCode::kInternalError,
-                                 "send request failed: " + write_error},
-                                {}};
+    auto result = RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "send request failed: " + write_error},
+        {}};
     Close();
     return result;
   }
 
   rpc::RpcResponse response;
   std::string read_error;
+  // 读取响应帧。
   if (!protocol::Codec::ReadMessage(sock_.Get(), &response, &read_error)) {
-    auto result = RpcCallResult{{common::ErrorCode::kInternalError,
-                                 "read response failed: " + read_error},
-                                {}};
+    auto result = RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "read response failed: " + read_error},
+        {}};
     Close();
     return result;
   }
 
   if (response.request_id() != request.request_id()) {
+    // 当前实现为串行请求，request_id 不匹配视为协议异常。
     return RpcCallResult{
-        {common::ErrorCode::kInternalError, "request_id mismatch"}, {}};
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "request_id mismatch"},
+        {}};
   }
 
   return RpcCallResult{
