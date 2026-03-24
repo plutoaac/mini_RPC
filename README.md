@@ -20,6 +20,7 @@
 - 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
 - 自动化测试入口（协议层、注册中心、端到端）
 - Benchmark 入口（单连接延迟与吞吐）
+- PendingCalls 雏形（`request_id -> result slot`）
 
 ## 2. 架构说明
 
@@ -64,6 +65,12 @@
   - 构造并发送 `RpcRequest`
   - 接收并解析 `RpcResponse`
   - 通过 `Status(std::error_code + message)` 返回统一错误
+  - 通过 `PendingCalls` 进行请求与响应关联（为多 in-flight 扩展铺垫）
+
+- `src/client/pending_calls.*`
+  - 维护 `request_id -> result slot` 的线程安全表
+  - 支持 `Add / Complete / Pop / FailAll`
+  - 当前用于串行调用结构铺垫，后续可升级为 promise/future 模式
 
 - `src/common/rpc_error.h`
   - 定义框架错误枚举与 `std::error_code` category
@@ -188,6 +195,11 @@ rpc::client::RpcClient client(
 - `e2e_test`：端到端
   - Add(1,2)=3
   - 不存在方法返回 `METHOD_NOT_FOUND`
+
+- `pending_calls_test`：pending 表
+  - Add/Complete/Pop 基本行为
+  - FailAll 行为
+  - 并发 Add/Complete/Pop 基础正确性
 
 运行方式：
 

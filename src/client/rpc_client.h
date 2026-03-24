@@ -3,30 +3,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 
-#include "common/rpc_error.h"
+#include "client/rpc_types.h"
 #include "common/unique_fd.h"
 
 namespace rpc::client {
 
-/// RPC 调用结果结构体
-/// 统一携带调用状态和响应数据，便于调用方判断成功与否并获取结果。
-struct RpcCallResult {
-  /// 调用状态，包含错误码和错误信息
-  /// 默认初始化为内部错误状态，防止未初始化使用
-  rpc::common::Status status{
-      rpc::common::make_error_code(rpc::common::ErrorCode::kInternalError),
-      "uninitialized"};
-
-  /// 响应负载：业务响应 protobuf 序列化后的二进制数据
-  std::string response_payload;
-
-  /// 检查调用是否成功
-  /// @return 状态码为 OK 时返回 true
-  [[nodiscard]] bool ok() const noexcept { return status.ok(); }
-};
+class PendingCalls;
 
 /// RPC 客户端配置选项
 /// 用于定制连接超时等行为。
@@ -104,6 +90,7 @@ class RpcClient {
   rpc::common::UniqueFd sock_;
   /// 下一个请求 ID，原子变量保证线程安全的递增
   std::atomic<std::uint64_t> next_id_;
+  std::unique_ptr<PendingCalls> pending_calls_;
 };
 
 }  // namespace rpc::client

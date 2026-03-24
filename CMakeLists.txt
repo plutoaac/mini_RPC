@@ -24,6 +24,7 @@ add_library(rpc_framework
     src/protocol/codec.cpp
     src/server/service_registry.cpp
     src/server/rpc_server.cpp
+    src/client/pending_calls.cpp
     src/client/rpc_client.cpp
 )
 
@@ -93,6 +94,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME e2e_test COMMAND e2e_test)
+
+    add_executable(pending_calls_test
+        tests/pending_calls_test.cpp
+    )
+
+    target_link_libraries(pending_calls_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME pending_calls_test COMMAND pending_calls_test)
 endif()
 
 add_executable(rpc_benchmark
