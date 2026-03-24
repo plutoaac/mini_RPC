@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <cerrno>
 #include <cstring>
@@ -16,17 +15,17 @@
 namespace rpc::client {
 
 RpcClient::RpcClient(std::string host, std::uint16_t port)
-    : host_(std::move(host)), port_(port), sock_fd_(-1), next_id_(0) {}
+    : host_(std::move(host)), port_(port), next_id_(0) {}
 
 RpcClient::~RpcClient() { Close(); }
 
 bool RpcClient::Connect() {
-  if (sock_fd_ >= 0) {
+  if (sock_) {
     return true;
   }
 
-  sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (sock_fd_ < 0) {
+  common::UniqueFd conn_fd(::socket(AF_INET, SOCK_STREAM, 0));
+  if (!conn_fd) {
     std::cerr << "[ERROR] client socket failed: " << std::strerror(errno)
               << '\n';
     return false;
@@ -41,23 +40,19 @@ bool RpcClient::Connect() {
     return false;
   }
 
-  if (::connect(sock_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-      0) {
+  if (::connect(conn_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
+                sizeof(addr)) < 0) {
     std::cerr << "[ERROR] connect failed: " << std::strerror(errno) << '\n';
     Close();
     return false;
   }
 
+  sock_ = std::move(conn_fd);
   std::cout << "[INFO] connected to " << host_ << ':' << port_ << '\n';
   return true;
 }
 
-void RpcClient::Close() {
-  if (sock_fd_ >= 0) {
-    ::close(sock_fd_);
-    sock_fd_ = -1;
-  }
-}
+void RpcClient::Close() { sock_.Reset(); }
 
 std::string RpcClient::NextRequestId() {
   const std::uint64_t id = ++next_id_;
@@ -68,7 +63,8 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
                               std::string_view method_name,
                               std::string_view request_payload) {
   if (!Connect()) {
-    return RpcCallResult{rpc::INTERNAL_ERROR, "connect failed", {}};
+    return RpcCallResult{{common::ErrorCode::kInternalError, "connect failed"},
+                         {}};
   }
 
   rpc::RpcRequest request;
@@ -78,28 +74,32 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
   request.set_payload(std::string(request_payload));
 
   std::string write_error;
-  if (!protocol::Codec::WriteMessage(sock_fd_, request, &write_error)) {
-    auto result = RpcCallResult{
-        rpc::INTERNAL_ERROR, "send request failed: " + write_error, {}};
+  if (!protocol::Codec::WriteMessage(sock_.Get(), request, &write_error)) {
+    auto result = RpcCallResult{{common::ErrorCode::kInternalError,
+                                 "send request failed: " + write_error},
+                                {}};
     Close();
     return result;
   }
 
   rpc::RpcResponse response;
   std::string read_error;
-  if (!protocol::Codec::ReadMessage(sock_fd_, &response, &read_error)) {
-    auto result = RpcCallResult{
-        rpc::INTERNAL_ERROR, "read response failed: " + read_error, {}};
+  if (!protocol::Codec::ReadMessage(sock_.Get(), &response, &read_error)) {
+    auto result = RpcCallResult{{common::ErrorCode::kInternalError,
+                                 "read response failed: " + read_error},
+                                {}};
     Close();
     return result;
   }
 
   if (response.request_id() != request.request_id()) {
-    return RpcCallResult{rpc::INTERNAL_ERROR, "request_id mismatch", {}};
+    return RpcCallResult{
+        {common::ErrorCode::kInternalError, "request_id mismatch"}, {}};
   }
 
-  return RpcCallResult{response.error_code(), response.error_msg(),
-                       response.payload()};
+  return RpcCallResult{
+      {common::FromProtoErrorCode(response.error_code()), response.error_msg()},
+      response.payload()};
 }
 
 }  // namespace rpc::client

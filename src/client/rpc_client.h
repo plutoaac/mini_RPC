@@ -5,16 +5,17 @@
 #include <string>
 #include <string_view>
 
-#include "rpc.pb.h"
+#include "common/rpc_error.h"
+#include "common/unique_fd.h"
 
 namespace rpc::client {
 
 struct RpcCallResult {
-  rpc::ErrorCode error_code{rpc::INTERNAL_ERROR};
-  std::string error_msg;
+  rpc::common::Status status{rpc::common::ErrorCode::kInternalError,
+                             "uninitialized"};
   std::string response_payload;
 
-  [[nodiscard]] bool ok() const noexcept { return error_code == rpc::OK; }
+  [[nodiscard]] bool ok() const noexcept { return status.ok(); }
 };
 
 class RpcClient {
@@ -37,7 +38,7 @@ class RpcClient {
 
   std::string host_;
   std::uint16_t port_;
-  int sock_fd_;
+  rpc::common::UniqueFd sock_;
   std::atomic<std::uint64_t> next_id_;
 };
 

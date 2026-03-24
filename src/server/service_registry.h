@@ -8,26 +8,12 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "common/rpc_error.h"
+
 namespace rpc::server {
 
-enum class RpcStatusCode {
-  kOk = 0,
-  kMethodNotFound = 1,
-  kParseError = 2,
-  kInternalError = 3,
-};
-
-// Framework exception type used by handlers to return business-level errors.
-class RpcError : public std::runtime_error {
- public:
-  RpcError(RpcStatusCode code, std::string message)
-      : std::runtime_error(std::move(message)), code_(code) {}
-
-  [[nodiscard]] RpcStatusCode code() const noexcept { return code_; }
-
- private:
-  RpcStatusCode code_;
-};
+using RpcStatusCode = rpc::common::ErrorCode;
+using RpcError = rpc::common::RpcException;
 
 // Generic handler: payload bytes in, payload bytes out.
 using Handler = std::function<std::string(std::string_view request_payload)>;

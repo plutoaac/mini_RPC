@@ -20,8 +20,9 @@ int main() {
 
   const auto result = client.Call("CalcService", "Add", request_payload);
   if (!result.ok()) {
-    std::cerr << "[ERROR] rpc failed: code=" << result.error_code
-              << " msg=" << result.error_msg << '\n';
+    std::cerr << "[ERROR] rpc failed: code="
+              << static_cast<int>(result.status.code)
+              << " msg=" << result.status.message << '\n';
     return 1;
   }
 

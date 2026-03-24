@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <cerrno>
 #include <cstring>
@@ -11,46 +10,28 @@
 #include <iostream>
 #include <string>
 
+#include "common/rpc_error.h"
+#include "common/unique_fd.h"
 #include "protocol/codec.h"
 #include "rpc.pb.h"
 
 namespace rpc::server {
 
-namespace {
-
-rpc::ErrorCode ToProtoCode(RpcStatusCode code) {
-  switch (code) {
-    case RpcStatusCode::kOk:
-      return rpc::OK;
-    case RpcStatusCode::kMethodNotFound:
-      return rpc::METHOD_NOT_FOUND;
-    case RpcStatusCode::kParseError:
-      return rpc::PARSE_ERROR;
-    case RpcStatusCode::kInternalError:
-      return rpc::INTERNAL_ERROR;
-    default:
-      return rpc::INTERNAL_ERROR;
-  }
-}
-
-}  // namespace
-
 RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry)
     : port_(port), registry_(registry) {}
 
 bool RpcServer::Start() {
-  const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd < 0) {
+  common::UniqueFd listen_fd(::socket(AF_INET, SOCK_STREAM, 0));
+  if (!listen_fd) {
     std::cerr << "[ERROR] socket failed: " << std::strerror(errno) << '\n';
     return false;
   }
 
   int reuse = 1;
-  if (::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
-      0) {
+  if (::setsockopt(listen_fd.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse,
+                   sizeof(reuse)) < 0) {
     std::cerr << "[ERROR] setsockopt(SO_REUSEADDR) failed: "
               << std::strerror(errno) << '\n';
-    ::close(listen_fd);
     return false;
   }
 
@@ -59,15 +40,14 @@ bool RpcServer::Start() {
   addr.sin_port = htons(port_);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+  if (::bind(listen_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
+             sizeof(addr)) < 0) {
     std::cerr << "[ERROR] bind failed: " << std::strerror(errno) << '\n';
-    ::close(listen_fd);
     return false;
   }
 
-  if (::listen(listen_fd, 128) < 0) {
+  if (::listen(listen_fd.Get(), 128) < 0) {
     std::cerr << "[ERROR] listen failed: " << std::strerror(errno) << '\n';
-    ::close(listen_fd);
     return false;
   }
 
@@ -76,9 +56,10 @@ bool RpcServer::Start() {
   while (true) {
     sockaddr_in client_addr{};
     socklen_t client_addr_len = sizeof(client_addr);
-    const int client_fd = ::accept(
-        listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-    if (client_fd < 0) {
+    common::UniqueFd client_fd(
+        ::accept(listen_fd.Get(), reinterpret_cast<sockaddr*>(&client_addr),
+                 &client_addr_len));
+    if (!client_fd) {
       if (errno == EINTR) {
         continue;
       }
@@ -91,8 +72,7 @@ bool RpcServer::Start() {
     std::cout << "[INFO] client connected: " << ip << ':'
               << ntohs(client_addr.sin_port) << '\n';
 
-    (void)HandleClient(client_fd);
-    ::close(client_fd);
+    (void)HandleClient(client_fd.Get());
     std::cout << "[INFO] client disconnected\n";
   }
 }
@@ -123,7 +103,7 @@ bool RpcServer::HandleClient(int client_fd) const {
         const std::string resp_payload = (*handler)(request.payload());
         response.set_payload(resp_payload);
       } catch (const RpcError& ex) {
-        response.set_error_code(ToProtoCode(ex.code()));
+        response.set_error_code(common::ToProtoErrorCode(ex.code()));
         response.set_error_msg(ex.what());
       } catch (const std::exception& ex) {
         response.set_error_code(rpc::INTERNAL_ERROR);
