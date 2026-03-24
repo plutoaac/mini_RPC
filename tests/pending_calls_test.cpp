@@ -1,6 +1,7 @@
 #include "client/pending_calls.h"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -21,17 +22,17 @@ void TestAddCompletePop() {
   assert(!pending.Add("1"));
 
   assert(pending.Complete("1", MakeOk("abc")));
-  const auto result = pending.Pop("1");
+  const auto result = pending.WaitAndPop("1", std::chrono::milliseconds(1));
   assert(result.has_value());
   assert(result->ok());
   assert(result->response_payload == "abc");
-  assert(!pending.Pop("1").has_value());
+  assert(!pending.TryPop("1").has_value());
 }
 
 void TestMissingCompletion() {
   rpc::client::PendingCalls pending;
   assert(!pending.Complete("not-exist", MakeOk("x")));
-  assert(!pending.Pop("not-exist").has_value());
+  assert(!pending.TryPop("not-exist").has_value());
 }
 
 void TestFailAll() {
@@ -45,8 +46,8 @@ void TestFailAll() {
       {}};
   pending.FailAll(fail);
 
-  const auto a = pending.Pop("a");
-  const auto b = pending.Pop("b");
+  const auto a = pending.WaitAndPop("a", std::chrono::milliseconds(1));
+  const auto b = pending.WaitAndPop("b", std::chrono::milliseconds(1));
   assert(a.has_value() && b.has_value());
   assert(!a->ok() && !b->ok());
   assert(a->status.message == "forced fail");
@@ -80,7 +81,8 @@ void TestConcurrentAddCompletePop() {
     int popped = 0;
     while (popped < kN) {
       const std::string id = std::to_string(popped);
-      if (auto res = pending.Pop(id); res.has_value()) {
+      if (auto res = pending.WaitAndPop(id, std::chrono::milliseconds(1));
+          res.has_value()) {
         assert(res->ok());
         ++popped;
       } else {

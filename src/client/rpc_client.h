@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "client/rpc_types.h"
 #include "common/unique_fd.h"
@@ -28,7 +30,7 @@ struct RpcClientOptions {
 /// 特点：
 /// - 维护单个 TCP 连接，首次调用时自动建立连接
 /// - 提供通用的 Call 接口，支持任意服务的任意方法调用
-/// - 线程不安全，如需多线程调用请使用多个客户端实例
+/// - 支持多线程并发 Call（写入串行化，响应由 dispatcher 线程分发）
 ///
 /// 使用示例：
 /// @code
@@ -80,6 +82,8 @@ class RpcClient {
   /// @return 字符串形式的请求 ID
   [[nodiscard]] std::string NextRequestId();
 
+  void DispatcherLoop();
+
   /// 服务器地址
   std::string host_;
   /// 服务器端口
@@ -88,6 +92,10 @@ class RpcClient {
   RpcClientOptions options_;
   /// socket 文件描述符，使用 RAII 包装自动管理生命周期
   rpc::common::UniqueFd sock_;
+  std::mutex connect_mu_;
+  std::mutex write_mu_;
+  std::thread dispatcher_thread_;
+  std::atomic<bool> dispatcher_running_{false};
   /// 下一个请求 ID，原子变量保证线程安全的递增
   std::atomic<std::uint64_t> next_id_;
   std::unique_ptr<PendingCalls> pending_calls_;

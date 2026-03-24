@@ -1,12 +1,16 @@
+#include <arpa/inet.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "calc.pb.h"
 #include "client/rpc_client.h"
@@ -16,15 +20,27 @@ namespace {
 
 bool WaitServerReady(const std::chrono::milliseconds timeout) {
   const auto start = std::chrono::steady_clock::now();
-  rpc::client::RpcClient probe(
-      "127.0.0.1", 50051,
-      {.send_timeout = std::chrono::milliseconds(200),
-       .recv_timeout = std::chrono::milliseconds(200)});
 
   while (std::chrono::steady_clock::now() - start < timeout) {
-    if (probe.Connect()) {
-      return true;
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) {
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(50051);
+      (void)::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+      if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ==
+          0) {
+        ::close(fd);
+        return true;
+      }
+      ::close(fd);
     }
+
+    if (errno != ECONNREFUSED && errno != ETIMEDOUT && errno != EINPROGRESS) {
+      // 对未知错误不立即失败，继续等待直到超时，避免瞬态问题。
+    }
+
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   return false;
@@ -72,6 +88,33 @@ int main() {
   assert(!missing_res.ok());
   assert(missing_res.status.code ==
          rpc::common::make_error_code(rpc::common::ErrorCode::kMethodNotFound));
+
+  // 并发调用验证：单连接多请求 in-flight 场景。
+  constexpr int kConcurrent = 16;
+  std::vector<std::thread> workers;
+  workers.reserve(kConcurrent);
+
+  for (int i = 0; i < kConcurrent; ++i) {
+    workers.emplace_back([&client, i]() {
+      calc::AddRequest req;
+      req.set_a(i);
+      req.set_b(i + 1);
+
+      std::string payload;
+      assert(req.SerializeToString(&payload));
+
+      const auto res = client.Call("CalcService", "Add", payload);
+      assert(res.ok());
+
+      calc::AddResponse resp;
+      assert(resp.ParseFromString(res.response_payload));
+      assert(resp.result() == i + (i + 1));
+    });
+  }
+
+  for (auto& w : workers) {
+    w.join();
+  }
 
   ::kill(pid, SIGTERM);
   ::waitpid(pid, nullptr, 0);
