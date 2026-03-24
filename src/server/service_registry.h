@@ -27,8 +27,8 @@ class ServiceRegistry {
                               std::string_view method_name, Handler handler);
 
   // 查询 handler；找不到返回 nullopt。
-  [[nodiscard]] std::optional<Handler> Find(std::string_view service_name,
-                                            std::string_view method_name) const;
+  [[nodiscard]] std::optional<std::reference_wrapper<const Handler>> Find(
+      std::string_view service_name, std::string_view method_name) const;
 
  private:
   // 统一 key 格式：service.method

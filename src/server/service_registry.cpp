@@ -30,7 +30,7 @@ bool ServiceRegistry::Register(std::string_view service_name,
   return handlers_.emplace(key, std::move(handler)).second;
 }
 
-std::optional<Handler> ServiceRegistry::Find(
+std::optional<std::reference_wrapper<const Handler>> ServiceRegistry::Find(
     std::string_view service_name, std::string_view method_name) const {
   // 查找与注册共享同一把锁，保证线程安全。
   std::scoped_lock lock(mutex_);
@@ -39,7 +39,7 @@ std::optional<Handler> ServiceRegistry::Find(
   if (it == handlers_.end()) {
     return std::nullopt;
   }
-  return it->second;
+  return std::cref(it->second);
 }
 
 }  // namespace rpc::server

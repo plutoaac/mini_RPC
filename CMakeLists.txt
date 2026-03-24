@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Protobuf REQUIRED)
+find_package(Threads REQUIRED)
+include(CTest)
 
 message(STATUS "Using Protobuf ${Protobuf_VERSION}")
 
@@ -53,4 +55,52 @@ add_executable(rpc_client_demo
 target_link_libraries(rpc_client_demo
     PRIVATE
         rpc_framework
+)
+
+if(BUILD_TESTING)
+    add_executable(codec_test
+        tests/codec_test.cpp
+    )
+
+    target_link_libraries(codec_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME codec_test COMMAND codec_test)
+
+    add_executable(service_registry_test
+        tests/service_registry_test.cpp
+    )
+
+    target_link_libraries(service_registry_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME service_registry_test COMMAND service_registry_test)
+
+    add_executable(e2e_test
+        tests/e2e_test.cpp
+    )
+
+    target_link_libraries(e2e_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME e2e_test COMMAND e2e_test)
+endif()
+
+add_executable(rpc_benchmark
+    benchmarks/rpc_benchmark.cpp
+)
+
+target_link_libraries(rpc_benchmark
+    PRIVATE
+        rpc_framework
+        Threads::Threads
 )

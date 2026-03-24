@@ -17,6 +17,9 @@
 - 基于 `std::error_code` 的统一错误体系
 - 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
 - 基于 `std::source_location` 的轻量结构化日志
+- 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
+- 自动化测试入口（协议层、注册中心、端到端）
+- Benchmark 入口（单连接延迟与吞吐）
 
 ## 2. 架构说明
 
@@ -49,6 +52,7 @@
 - `src/server/service_registry.*`
   - 通用注册表
   - handler 接口：输入请求 `bytes`，输出响应 `bytes`
+  - `Find()` 返回引用包装，避免复制 `std::function`
 
 - `src/server/rpc_server.*`
   - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
@@ -146,6 +150,69 @@ Add(1,2) = 3
 - 日志接口：`LogInfo/LogWarn/LogError`
 - 每条日志自动输出来源位置：文件名、行号、函数名
 - 适合后续替换为更完整的日志后端（如 spdlog / tracing）
+
+## 8. 超时机制
+
+客户端提供基础超时配置（阻塞式最小实现）：
+
+- `send_timeout`：写请求超时
+- `recv_timeout`：读响应超时
+
+示例：
+
+```cpp
+rpc::client::RpcClient client(
+    "127.0.0.1", 50051,
+    {.send_timeout = std::chrono::milliseconds(1000),
+     .recv_timeout = std::chrono::milliseconds(1000)});
+```
+
+说明：当前版本基于 `SO_SNDTIMEO` / `SO_RCVTIMEO`，后续可升级到更细粒度的 per-request deadline。
+
+## 9. 测试
+
+本项目已提供 3 类可重复执行测试：
+
+- `codec_test`：协议层
+  - 正常 encode/decode
+  - 长度为 0 的帧报错
+  - 超过最大帧长度报错
+  - protobuf 解析失败报错
+
+- `service_registry_test`：注册中心
+  - 注册成功
+  - 重复注册失败
+  - 未注册方法返回空
+  - 多线程并发注册/查找基础正确性
+
+- `e2e_test`：端到端
+  - Add(1,2)=3
+  - 不存在方法返回 `METHOD_NOT_FOUND`
+
+运行方式：
+
+```bash
+cd rpc_project
+cmake -S . -B build
+cmake --build build -j
+cd build
+ctest --output-on-failure
+```
+
+## 10. Benchmark
+
+提供单连接基准程序 `rpc_benchmark`，默认执行 1000 次 Add 调用，输出：
+
+- 平均延迟（avg）
+- p95 延迟
+- 吞吐（qps）
+
+运行示例：
+
+```bash
+cd rpc_project/build
+./rpc_benchmark 1000
+```
 
 ## 可扩展性说明
 

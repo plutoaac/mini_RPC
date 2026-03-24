@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -14,8 +15,34 @@
 
 namespace rpc::client {
 
-RpcClient::RpcClient(std::string host, std::uint16_t port)
-    : host_(std::move(host)), port_(port), next_id_(0) {}
+namespace {
+
+bool SetSocketTimeout(int fd, int optname, std::chrono::milliseconds timeout,
+                      std::string* error_msg) {
+  const auto sec = std::chrono::duration_cast<std::chrono::seconds>(timeout);
+  const auto usec =
+      std::chrono::duration_cast<std::chrono::microseconds>(timeout - sec);
+
+  timeval tv{};
+  tv.tv_sec = static_cast<decltype(tv.tv_sec)>(sec.count());
+  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(usec.count());
+
+  if (::setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv)) < 0) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          std::string("setsockopt timeout failed: ") + std::strerror(errno);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
+
+RpcClient::RpcClient(std::string host, std::uint16_t port,
+                     RpcClientOptions options)
+    : host_(std::move(host)), port_(port), options_(options), next_id_(0) {}
 
 RpcClient::~RpcClient() { Close(); }
 
@@ -45,6 +72,20 @@ bool RpcClient::Connect() {
   if (::connect(conn_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
                 sizeof(addr)) < 0) {
     common::LogError(std::string("connect failed: ") + std::strerror(errno));
+    Close();
+    return false;
+  }
+
+  std::string timeout_error;
+  if (!SetSocketTimeout(conn_fd.Get(), SO_SNDTIMEO, options_.send_timeout,
+                        &timeout_error)) {
+    common::LogError(timeout_error);
+    Close();
+    return false;
+  }
+  if (!SetSocketTimeout(conn_fd.Get(), SO_RCVTIMEO, options_.recv_timeout,
+                        &timeout_error)) {
+    common::LogError(timeout_error);
     Close();
     return false;
   }

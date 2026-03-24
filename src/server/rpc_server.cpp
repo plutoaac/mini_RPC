@@ -106,7 +106,7 @@ bool RpcServer::HandleClient(const rpc::common::UniqueFd& client_fd) const {
     } else {
       try {
         // 框架层只传递 bytes，不依赖具体业务 protobuf 类型。
-        const std::string resp_payload = (*handler)(request.payload());
+        const std::string resp_payload = handler->get()(request.payload());
         response.set_payload(resp_payload);
       } catch (const RpcError& ex) {
         // 业务显式抛出的框架异常，按统一错误码返回。
