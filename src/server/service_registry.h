@@ -2,8 +2,10 @@
 
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace rpc::server {
@@ -28,19 +30,19 @@ class RpcError : public std::runtime_error {
 };
 
 // Generic handler: payload bytes in, payload bytes out.
-using Handler = std::function<std::string(const std::string& request_payload)>;
+using Handler = std::function<std::string(std::string_view request_payload)>;
 
 class ServiceRegistry {
  public:
-  bool Register(std::string service_name, std::string method_name,
-                Handler handler);
+  [[nodiscard]] bool Register(std::string_view service_name,
+                              std::string_view method_name, Handler handler);
 
-  bool Find(const std::string& service_name, const std::string& method_name,
-            Handler* out_handler) const;
+  [[nodiscard]] std::optional<Handler> Find(std::string_view service_name,
+                                            std::string_view method_name) const;
 
  private:
-  static std::string BuildKey(const std::string& service_name,
-                              const std::string& method_name);
+  [[nodiscard]] static std::string BuildKey(std::string_view service_name,
+                                            std::string_view method_name);
 
   mutable std::mutex mutex_;
   std::unordered_map<std::string, Handler> handlers_;

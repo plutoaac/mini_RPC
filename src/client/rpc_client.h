@@ -3,27 +3,37 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <string_view>
+
+#include "rpc.pb.h"
 
 namespace rpc::client {
+
+struct RpcCallResult {
+  rpc::ErrorCode error_code{rpc::INTERNAL_ERROR};
+  std::string error_msg;
+  std::string response_payload;
+
+  [[nodiscard]] bool ok() const noexcept { return error_code == rpc::OK; }
+};
 
 class RpcClient {
  public:
   RpcClient(std::string host, std::uint16_t port);
   ~RpcClient();
 
-  bool Connect();
+  [[nodiscard]] bool Connect();
   void Close();
 
-  // Generic RPC call:
+  // Generic RPC call (modern API):
   // - request_payload: protobuf bytes of business request.
-  // - response_payload: protobuf bytes of business response.
-  // Returns true iff remote call succeeds with error_code == OK.
-  bool Call(const std::string& service_name, const std::string& method_name,
-            const std::string& request_payload, std::string* response_payload,
-            int* error_code, std::string* error_msg);
+  // - response_payload: protobuf bytes of business response in result.
+  [[nodiscard]] RpcCallResult Call(std::string_view service_name,
+                                   std::string_view method_name,
+                                   std::string_view request_payload);
 
  private:
-  std::string NextRequestId();
+  [[nodiscard]] std::string NextRequestId();
 
   std::string host_;
   std::uint16_t port_;

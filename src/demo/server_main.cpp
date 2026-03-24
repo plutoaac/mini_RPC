@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <string_view>
 
 #include "calc.pb.h"
 #include "server/rpc_server.h"
@@ -11,9 +12,10 @@ int main() {
 
   const bool registered = registry.Register(
       "CalcService", "Add",
-      [](const std::string& request_payload) -> std::string {
+      [](std::string_view request_payload) -> std::string {
         calc::AddRequest request;
-        if (!request.ParseFromString(request_payload)) {
+        if (!request.ParseFromArray(request_payload.data(),
+                                    static_cast<int>(request_payload.size()))) {
           throw rpc::server::RpcError(rpc::server::RpcStatusCode::kParseError,
                                       "failed to parse calc::AddRequest");
         }

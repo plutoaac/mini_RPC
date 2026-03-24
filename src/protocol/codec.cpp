@@ -6,15 +6,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace rpc::protocol {
 
-bool Codec::ReadN(int fd, void* buffer, std::size_t n, std::string* error_msg) {
-  auto* out = static_cast<std::uint8_t*>(buffer);
-  std::size_t left = n;
+bool Codec::ReadN(int fd, std::span<std::byte> buffer, std::string* error_msg) {
+  auto* out = reinterpret_cast<std::uint8_t*>(buffer.data());
+  std::size_t left = buffer.size_bytes();
 
   while (left > 0) {
     const ssize_t rc = ::recv(fd, out, left, 0);
@@ -40,10 +42,10 @@ bool Codec::ReadN(int fd, void* buffer, std::size_t n, std::string* error_msg) {
   return true;
 }
 
-bool Codec::WriteN(int fd, const void* buffer, std::size_t n,
+bool Codec::WriteN(int fd, std::span<const std::byte> buffer,
                    std::string* error_msg) {
-  const auto* in = static_cast<const std::uint8_t*>(buffer);
-  std::size_t left = n;
+  const auto* in = reinterpret_cast<const std::uint8_t*>(buffer.data());
+  std::size_t left = buffer.size_bytes();
 
   while (left > 0) {
     const ssize_t rc = ::send(fd, in, left, MSG_NOSIGNAL);
@@ -73,7 +75,9 @@ bool Codec::ReadMessage(int fd, google::protobuf::Message* message,
   }
 
   std::uint32_t be_length = 0;
-  if (!ReadN(fd, &be_length, sizeof(be_length), error_msg)) {
+  auto length_bytes =
+      std::as_writable_bytes(std::span{&be_length, std::size_t{1}});
+  if (!ReadN(fd, length_bytes, error_msg)) {
     return false;
   }
 
@@ -86,7 +90,8 @@ bool Codec::ReadMessage(int fd, google::protobuf::Message* message,
   }
 
   std::vector<char> buffer(body_length);
-  if (!ReadN(fd, buffer.data(), body_length, error_msg)) {
+  auto body_bytes = std::as_writable_bytes(std::span{buffer});
+  if (!ReadN(fd, body_bytes, error_msg)) {
     return false;
   }
 
@@ -123,10 +128,13 @@ bool Codec::WriteMessage(int fd, const google::protobuf::Message& message,
 
   const std::uint32_t be_length =
       htonl(static_cast<std::uint32_t>(body_length));
-  if (!WriteN(fd, &be_length, sizeof(be_length), error_msg)) {
+  const auto length_bytes =
+      std::as_bytes(std::span{&be_length, std::size_t{1}});
+  if (!WriteN(fd, length_bytes, error_msg)) {
     return false;
   }
-  if (!WriteN(fd, body.data(), body.size(), error_msg)) {
+  const auto body_bytes = std::as_bytes(std::span{body.data(), body.size()});
+  if (!WriteN(fd, body_bytes, error_msg)) {
     return false;
   }
 

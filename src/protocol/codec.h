@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace google::protobuf {
@@ -27,9 +28,9 @@ class Codec {
  private:
   static constexpr std::size_t kMaxFrameSize = 4 * 1024 * 1024;
 
-  static bool ReadN(int fd, void* buffer, std::size_t n,
+  static bool ReadN(int fd, std::span<std::byte> buffer,
                     std::string* error_msg);
-  static bool WriteN(int fd, const void* buffer, std::size_t n,
+  static bool WriteN(int fd, std::span<const std::byte> buffer,
                      std::string* error_msg);
 };
 

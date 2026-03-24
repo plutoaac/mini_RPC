@@ -112,15 +112,15 @@ bool RpcServer::HandleClient(int client_fd) const {
     response.set_request_id(request.request_id());
     response.set_error_code(rpc::OK);
 
-    Handler handler;
-    if (!registry_.Find(request.service_name(), request.method_name(),
-                        &handler)) {
+    if (const auto handler =
+            registry_.Find(request.service_name(), request.method_name());
+        !handler.has_value()) {
       response.set_error_code(rpc::METHOD_NOT_FOUND);
       response.set_error_msg("method not found: " + request.service_name() +
                              "." + request.method_name());
     } else {
       try {
-        const std::string resp_payload = handler(request.payload());
+        const std::string resp_payload = (*handler)(request.payload());
         response.set_payload(resp_payload);
       } catch (const RpcError& ex) {
         response.set_error_code(ToProtoCode(ex.code()));
