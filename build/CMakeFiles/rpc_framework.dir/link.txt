@@ -1,2 +1,0 @@
-/usr/bin/ar qc librpc_framework.a  CMakeFiles/rpc_framework.dir/rpc.pb.cc.o CMakeFiles/rpc_framework.dir/calc.pb.cc.o CMakeFiles/rpc_framework.dir/src/protocol/codec.cpp.o CMakeFiles/rpc_framework.dir/src/server/service_registry.cpp.o CMakeFiles/rpc_framework.dir/src/server/rpc_server.cpp.o CMakeFiles/rpc_framework.dir/src/client/rpc_client.cpp.o
-/usr/bin/ranlib librpc_framework.a

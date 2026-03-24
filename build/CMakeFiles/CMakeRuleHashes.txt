@@ -1,3 +1,0 @@
-# Hashes of file build rules.
-18916d703cbc9b99eca6bf1dd3d7d768 calc.pb.h
-d4ab47781561f5364b0bbe26ee6cf9b4 rpc.pb.h

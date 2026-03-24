@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+
+# CMake generated files (if generated in source dir)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled outputs
+*.o
+*.a
+*.so
+*.out
