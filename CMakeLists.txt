@@ -24,6 +24,7 @@ add_library(rpc_framework
     src/protocol/codec.cpp
     src/server/service_registry.cpp
     src/server/rpc_server.cpp
+    src/client/event_loop.cpp
     src/client/pending_calls.cpp
     src/client/rpc_client.cpp
 )
@@ -59,6 +60,18 @@ target_link_libraries(rpc_client_demo
 )
 
 if(BUILD_TESTING)
+    add_executable(event_loop_test
+        tests/event_loop_test.cpp
+    )
+
+    target_link_libraries(event_loop_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME event_loop_test COMMAND event_loop_test)
+
     add_executable(codec_test
         tests/codec_test.cpp
     )

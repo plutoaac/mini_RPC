@@ -12,6 +12,7 @@
 #include <string_view>
 #include <thread>
 
+#include "client/event_loop.h"
 #include "client/pending_calls.h"
 #include "common/log.h"
 #include "protocol/codec.h"
@@ -52,6 +53,61 @@ bool IsTemporaryReadFailure(std::string_view read_error) {
   return read_error.find("Resource temporarily unavailable") !=
              std::string_view::npos ||
          read_error.find("recv timeout") != std::string_view::npos;
+}
+
+constexpr std::size_t kFrameHeaderBytes = 4;
+constexpr std::size_t kMaxFrameSize = 4 * 1024 * 1024;
+
+bool HandleReadableFrames(std::string* read_buffer,
+                          const std::shared_ptr<PendingCalls>& pending_calls) {
+  // 允许一次网络读取携带多帧响应：循环尽量解析完整帧，剩余半包留在缓冲区。
+  std::size_t offset = 0;
+
+  while (read_buffer->size() - offset >= kFrameHeaderBytes) {
+    std::uint32_t be_length = 0;
+    std::memcpy(&be_length, read_buffer->data() + offset, kFrameHeaderBytes);
+    const std::uint32_t body_length = ntohl(be_length);
+    if (body_length == 0 || body_length > kMaxFrameSize) {
+      pending_calls->FailAll(RpcCallResult{
+          {common::make_error_code(common::ErrorCode::kInternalError),
+           "invalid response frame length"},
+          {}});
+      return false;
+    }
+
+    if (read_buffer->size() - offset <
+        kFrameHeaderBytes + static_cast<std::size_t>(body_length)) {
+      // 半包：等待后续可读事件补齐。
+      break;
+    }
+
+    rpc::RpcResponse response;
+    if (!response.ParseFromArray(
+            read_buffer->data() + offset + kFrameHeaderBytes,
+            static_cast<int>(body_length))) {
+      pending_calls->FailAll(RpcCallResult{
+          {common::make_error_code(common::ErrorCode::kParseError),
+           "failed to parse RpcResponse"},
+          {}});
+      return false;
+    }
+
+    const RpcCallResult mapped_result{
+        {common::FromProtoErrorCode(response.error_code()),
+         response.error_msg()},
+        response.payload()};
+    if (!pending_calls->Complete(response.request_id(), mapped_result)) {
+      common::LogWarn("response request_id not found in pending table: " +
+                      response.request_id());
+    }
+
+    offset += kFrameHeaderBytes + static_cast<std::size_t>(body_length);
+  }
+
+  if (offset > 0) {
+    read_buffer->erase(0, offset);
+  }
+  return true;
 }
 
 }  // namespace
@@ -121,6 +177,9 @@ void RpcClient::Close() {
   {
     std::scoped_lock lock(connect_mu_);
     dispatcher_running_.store(false);
+    if (event_loop_ != nullptr) {
+      event_loop_->Wakeup();
+    }
     if (sock_) {
       // 主动半关闭可尽快唤醒阻塞在 recv 的 dispatcher 线程。
       (void)::shutdown(sock_.Get(), SHUT_RDWR);
@@ -219,82 +278,138 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
 
 /// RPC 响应分发循环
 ///
-/// 在独立线程中运行，持续从服务器读取响应消息并分发给对应的等待调用。
-/// 该循环是客户端实现同步调用的核心组件，将异步网络 IO 转换为同步等待模式。
+/// 在独立线程中运行，由 event loop 监听 socket 可读事件并分发响应。
 ///
 /// 工作流程：
-/// 1. 获取当前有效的 socket 文件描述符
-/// 2. 阻塞读取服务器响应消息
-/// 3. 根据响应中的 request_id 找到对应的等待请求并完成它
-/// 4. 处理各种错误情况（超时、连接断开等）
+/// 1. 等待 socket 可读或 tick 超时
+/// 2. 可读时读取并解析长度前缀帧
+/// 3. 根据 response.request_id 完成 pending call
+/// 4. tick 时触发按请求超时清理
 void RpcClient::DispatcherLoop() {
-  // 主循环：持续运行直到收到停止信号
-  while (dispatcher_running_.load()) {
-    // 获取 socket fd，需要加锁保证线程安全
-    int fd = -1;
-    {
-      std::scoped_lock lock(connect_mu_);
-      // 如果 socket 已关闭，退出循环
-      if (!sock_) {
-        break;
-      }
-      fd = sock_.Get();
+  int fd = -1;
+  {
+    std::scoped_lock lock(connect_mu_);
+    if (!sock_) {
+      return;
     }
+    fd = sock_.Get();
+  }
 
-    // 尝试从服务器读取响应消息
-    rpc::RpcResponse response;
-    std::string read_error;
-    if (!protocol::Codec::ReadMessage(fd, &response, &read_error)) {
-      // 读取失败，检查是否是因为调度器已停止
-      if (!dispatcher_running_.load()) {
-        break;
-      }
+  auto local_loop = std::make_shared<EventLoop>();
+  if (!local_loop->Init()) {
+    pending_calls_->FailAll(RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "event loop init failed"},
+        {}});
+    dispatcher_running_.store(false);
+    return;
+  }
 
-      // 如果是临时性错误（资源暂时不可用或接收超时），继续循环重试
-      // 这些是非阻塞模式下的正常情况，不是真正的错误
-      if (IsTemporaryReadFailure(read_error)) {
+  if (!local_loop->SetReadFd(fd)) {
+    if (!dispatcher_running_.load()) {
+      return;
+    }
+    pending_calls_->FailAll(RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "event loop add fd failed"},
+        {}});
+    dispatcher_running_.store(false);
+    return;
+  }
+
+  {
+    std::scoped_lock lock(connect_mu_);
+    event_loop_ = local_loop;
+  }
+
+  std::string read_buffer;
+  read_buffer.reserve(8192);
+
+  // reactor 主循环：事件等待 + 读取解析 + request_id 分发 + 超时清理。
+  while (dispatcher_running_.load()) {
+    switch (local_loop->WaitOnce(50)) {
+      case EventLoop::WaitResult::kTimeout:
         pending_calls_->FailTimedOut(
             std::chrono::steady_clock::now(),
             RpcCallResult{
                 {common::make_error_code(common::ErrorCode::kInternalError),
                  "call timeout"},
                 {}});
-        continue;
+        break;
+      case EventLoop::WaitResult::kWakeup:
+        break;
+      case EventLoop::WaitResult::kError:
+        pending_calls_->FailAll(RpcCallResult{
+            {common::make_error_code(common::ErrorCode::kInternalError),
+             "dispatcher stopped: event loop error"},
+            {}});
+        dispatcher_running_.store(false);
+        break;
+      case EventLoop::WaitResult::kReadable: {
+        bool keep_running = true;
+        bool peer_closed = false;
+        // 非阻塞 drain：一次可读事件尽可能把内核缓冲区读空，降低 event 次数。
+        while (keep_running) {
+          char chunk[4096];
+          const ssize_t rc = ::recv(fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+          if (rc > 0) {
+            read_buffer.append(chunk, static_cast<std::size_t>(rc));
+            continue;
+          }
+          if (rc == 0) {
+            peer_closed = true;
+            keep_running = false;
+            break;
+          }
+
+          if (errno == EINTR) {
+            continue;
+          }
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+          }
+
+          std::string read_error =
+              std::string("recv failed: ") + std::strerror(errno);
+          if (!IsTemporaryReadFailure(read_error)) {
+            common::LogError("dispatcher read failed: " + read_error);
+            pending_calls_->FailAll(RpcCallResult{
+                {common::make_error_code(common::ErrorCode::kInternalError),
+                 "dispatcher stopped: " + read_error},
+                {}});
+            dispatcher_running_.store(false);
+            keep_running = false;
+          }
+          break;
+        }
+
+        if (!dispatcher_running_.load()) {
+          break;
+        }
+
+        if (!HandleReadableFrames(&read_buffer, pending_calls_)) {
+          dispatcher_running_.store(false);
+          break;
+        }
+
+        if (peer_closed) {
+          // 先解析已读缓存，再对仍未完成请求做失败收敛，避免“先到响应被覆盖”。
+          if (pending_calls_->Size() > 0) {
+            pending_calls_->FailAll(RpcCallResult{
+                {common::make_error_code(common::ErrorCode::kInternalError),
+                 "dispatcher stopped: peer closed connection"},
+                {}});
+          }
+          dispatcher_running_.store(false);
+        }
+        break;
       }
-
-      // 记录错误日志（对端正常关闭连接的情况除外）
-      if (read_error != "peer closed connection") {
-        common::LogError("dispatcher read failed: " + read_error);
-      }
-
-      // 读取失败，将所有等待中的调用标记为失败
-      pending_calls_->FailAll(RpcCallResult{
-          {common::make_error_code(common::ErrorCode::kInternalError),
-           "dispatcher stopped: " + read_error},
-          {}});
-      // 停止调度器
-      dispatcher_running_.store(false);
-      break;
     }
+  }
 
-    // 读取成功，构造结果对象
-    // 将 protobuf 错误码映射为本地错误码
-    // mapped_result 随后会通过 Complete() 传递给对应的等待线程
-    const RpcCallResult mapped_result{
-        {common::FromProtoErrorCode(response.error_code()),
-         response.error_msg()},
-        response.payload()};
-
-    // 根据 request_id 完成对应的等待调用
-    // Complete() 会：
-    // 1. 找到 request_id 对应的 Slot
-    // 2. 将 mapped_result 存入 Slot
-    // 3. 唤醒正在 WaitAndPop() 中等待的调用线程
-    // 如果找不到对应的 request_id，说明该请求可能已超时被移除
-    if (!pending_calls_->Complete(response.request_id(), mapped_result)) {
-      common::LogWarn("response request_id not found in pending table: " +
-                      response.request_id());
-    }
+  {
+    std::scoped_lock lock(connect_mu_);
+    event_loop_.reset();
   }
 }
 

@@ -16,6 +16,7 @@
 namespace rpc::client {
 
 class PendingCalls;
+class EventLoop;
 
 /// RPC 客户端配置选项
 /// 用于定制连接超时等行为。
@@ -109,6 +110,7 @@ class RpcClient {
   std::mutex write_mu_;
   std::thread dispatcher_thread_;
   std::atomic<bool> dispatcher_running_{false};
+  std::shared_ptr<EventLoop> event_loop_;
   /// 下一个请求 ID，原子变量保证线程安全的递增
   std::atomic<std::uint64_t> next_id_;
   std::shared_ptr<PendingCalls> pending_calls_;

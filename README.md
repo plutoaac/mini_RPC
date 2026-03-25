@@ -6,6 +6,8 @@
 - C++20 coroutine 版本
 - io_uring 异步 IO 版本
 
+本阶段已从纯阻塞式客户端分发循环，演进到轻量 event loop / reactor 雏形。
+
 ## 1. 项目介绍
 
 框架能力（当前版本）：
@@ -19,7 +21,7 @@
 - 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
 - 基于 `std::source_location` 的轻量结构化日志
 - 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
-- 客户端读写分工模型（调用线程发送 + dispatcher 线程按 `request_id` 分发响应）
+- 客户端读写分工模型（调用线程发送 + event loop 驱动可读事件）
 - 自动化测试入口（协议层、注册中心、端到端）
 - Benchmark 入口（单连接延迟与吞吐）
 - PendingCalls（`request_id -> result slot`）与连接关闭竞态保护
@@ -65,12 +67,18 @@
 - `src/client/rpc_client.*`
   - 连接服务端
   - 构造并发送 `RpcRequest`
-  - 独立 dispatcher 线程持续接收并解析 `RpcResponse`
+  - 独立 dispatcher 线程运行 event loop，监听 socket 可读事件
+  - 非阻塞读取并解析长度前缀响应帧
   - 按 `request_id` 精确完成对应 in-flight 请求（含 async future）
   - 提供 `CallAsync`（future-like 最小版本）
   - 同步 `Call` 基于 `CallAsync().get()` 封装
   - 通过 `Status(std::error_code + message)` 返回统一错误
   - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
+
+- `src/client/event_loop.*`
+  - 轻量 epoll event loop（单线程、单连接 fd）
+  - 负责可读事件等待、超时 tick 与 wakeup
+  - 作为后续 coroutine 客户端调度的基础骨架
 
 - `src/client/pending_calls.*`
   - 维护 `request_id -> result slot` 的线程安全表
@@ -198,17 +206,22 @@ std::future<RpcCallResult> CallAsync(
 - 复用当前 `request_id + PendingCalls + dispatcher` 主链路
 - `CallAsync` 负责发请求并返回 `future`
 - `CallAsync` 在 PendingCalls 注册 async 等待状态（promise + deadline）
-- dispatcher 收到响应后直接按 `request_id` 完成 promise
+- dispatcher 的 event loop 收到可读事件后，解析响应并按 `request_id` 直接完成 promise
 - 同步 `Call` 改为 `CallAsync(...).get()`，保持现有调用行为
 
 定位说明：
 
-- 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下去掉 per-call watcher 线程
-- 当前结构已为后续 coroutine/awaitable 版本铺路
+- 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下引入 reactor 思路
+- 当前结构已为后续 coroutine/awaitable 版本铺路（I/O readiness 与完成分发职责已分层）
 
 ## 10. 测试
 
-本项目已提供 7 类可重复执行测试：
+本项目已提供 8 类可重复执行测试：
+
+- `event_loop_test`：event loop 基础行为
+  - 可读事件触发
+  - 超时返回
+  - wakeup 事件触发
 
 - `codec_test`：协议层
   - 正常 encode/decode
@@ -280,5 +293,6 @@ cd rpc_project/build
 
 当前代码保持阻塞式最小闭环，但接口设计已为后续扩展预留：
 - `Codec` 可替换为异步读写实现（epoll/io_uring）
+- 客户端已具备轻量 reactor 骨架，可演进为 coroutine 驱动 I/O
 - `RpcServer` 的连接处理可演进为协程调度
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
