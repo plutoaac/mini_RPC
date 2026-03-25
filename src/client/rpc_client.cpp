@@ -15,6 +15,7 @@
 #include "client/event_loop.h"
 #include "client/pending_calls.h"
 #include "common/log.h"
+#include "coroutine/future_awaiter.h"
 #include "protocol/codec.h"
 
 namespace rpc::client {
@@ -274,6 +275,13 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
                               std::string_view method_name,
                               std::string_view request_payload) {
   return CallAsync(service_name, method_name, request_payload).get();
+}
+
+rpc::coroutine::Task<RpcCallResult> RpcClient::CallCo(
+    std::string_view service_name, std::string_view method_name,
+    std::string_view request_payload) {
+  co_return co_await rpc::coroutine::FromFuture(
+      CallAsync(service_name, method_name, request_payload));
 }
 
 /// RPC 响应分发循环

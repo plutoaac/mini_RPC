@@ -59,6 +59,15 @@ target_link_libraries(rpc_client_demo
         rpc_framework
 )
 
+add_executable(rpc_coroutine_client_demo
+    src/demo/coroutine_client_main.cpp
+)
+
+target_link_libraries(rpc_coroutine_client_demo
+    PRIVATE
+        rpc_framework
+)
+
 if(BUILD_TESTING)
     add_executable(event_loop_test
         tests/event_loop_test.cpp
@@ -143,6 +152,54 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME call_async_close_test COMMAND call_async_close_test)
+
+    add_executable(call_co_basic_test
+        tests/call_co_basic_test.cpp
+    )
+
+    target_link_libraries(call_co_basic_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_co_basic_test COMMAND call_co_basic_test)
+
+    add_executable(call_co_out_of_order_test
+        tests/call_co_out_of_order_test.cpp
+    )
+
+    target_link_libraries(call_co_out_of_order_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_co_out_of_order_test COMMAND call_co_out_of_order_test)
+
+    add_executable(call_co_timeout_test
+        tests/call_co_timeout_test.cpp
+    )
+
+    target_link_libraries(call_co_timeout_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_co_timeout_test COMMAND call_co_timeout_test)
+
+    add_executable(call_co_close_test
+        tests/call_co_close_test.cpp
+    )
+
+    target_link_libraries(call_co_close_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_co_close_test COMMAND call_co_close_test)
 
     add_executable(pending_calls_test
         tests/pending_calls_test.cpp

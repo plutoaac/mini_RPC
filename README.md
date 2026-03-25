@@ -8,6 +8,9 @@
 
 本阶段已从纯阻塞式客户端分发循环，演进到轻量 event loop / reactor 雏形。
 
+当前版本已在现有 async client 底层之上新增最小 coroutine API（`CallCo` + `Task<T>`），
+用于提供 `co_await` 编程体验，不改变现有 I/O 与分发模型。
+
 ## 1. 项目介绍
 
 框架能力（当前版本）：
@@ -17,6 +20,7 @@
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
 - 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
+- 客户端协程调用接口（`CallCo`，返回 `Task<RpcCallResult>`）
 - 基于 `std::error_code` 的统一错误体系
 - 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
 - 基于 `std::source_location` 的轻量结构化日志
@@ -71,6 +75,7 @@
   - 非阻塞读取并解析长度前缀响应帧
   - 按 `request_id` 精确完成对应 in-flight 请求（含 async future）
   - 提供 `CallAsync`（future-like 最小版本）
+  - 提供 `CallCo`（coroutine 最小桥接层）
   - 同步 `Call` 基于 `CallAsync().get()` 封装
   - 通过 `Status(std::error_code + message)` 返回统一错误
   - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
@@ -214,9 +219,45 @@ std::future<RpcCallResult> CallAsync(
 - 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下引入 reactor 思路
 - 当前结构已为后续 coroutine/awaitable 版本铺路（I/O readiness 与完成分发职责已分层）
 
-## 10. 测试
+## 10. CallCo（最小 coroutine 接口层）
 
-本项目已提供 8 类可重复执行测试：
+客户端新增了 coroutine 友好接口：
+
+```cpp
+Task<RpcCallResult> CallCo(
+  std::string_view service_name,
+  std::string_view method_name,
+  std::string_view request_payload);
+```
+
+最小使用示例：
+
+```cpp
+rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
+                                const std::string& payload) {
+  auto result = co_await client.CallCo("CalcService", "Add", payload);
+  if (!result.ok()) {
+    co_return;
+  }
+  co_return;
+}
+```
+
+定位说明：
+
+- coroutine 层是增量包装层，复用现有 `CallAsync + PendingCalls + dispatcher/event loop`
+- 当前版本主要提升调用侧编程模型，不引入完整 coroutine runtime
+- bridge 方式仍有额外 future/awaiter 开销，但实现简单且便于学习
+
+可运行示例：
+
+```bash
+./build/rpc_coroutine_client_demo
+```
+
+## 11. 测试
+
+本项目已提供 12 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -257,6 +298,21 @@ std::future<RpcCallResult> CallAsync(
   - `Close()` 后未完成的 async future 必须收到失败结果
   - 验证不会出现 future 永远不完成
 
+- `call_co_basic_test`：coroutine 调用基础成功
+  - `co_await client.CallCo(...)` 可获得正确结果
+  - 多个 coroutine 请求结果正确
+
+- `call_co_out_of_order_test`：coroutine 乱序响应分发
+  - 服务端逆序返回响应
+  - 验证 coroutine 调用仍按 request_id 正确匹配
+
+- `call_co_timeout_test`：coroutine 超时收敛
+  - 并发 coroutine 请求中慢请求超时
+  - 快请求结果不受影响
+
+- `call_co_close_test`：coroutine 连接关闭收敛
+  - `Close()` 后未完成 coroutine 调用返回失败结果
+
 运行方式：
 
 ```bash
@@ -274,7 +330,14 @@ cd rpc_project/build
 ctest --output-on-failure -R 'out_of_order_dispatcher_test|call_async_timeout_test|call_async_close_test'
 ```
 
-## 11. Benchmark
+仅运行 coroutine 相关测试：
+
+```bash
+cd rpc_project/build
+ctest --output-on-failure -R 'call_co_basic_test|call_co_out_of_order_test|call_co_timeout_test|call_co_close_test'
+```
+
+## 12. Benchmark
 
 提供单连接基准程序 `rpc_benchmark`，默认执行 1000 次 Add 调用，输出：
 
@@ -289,10 +352,15 @@ cd rpc_project/build
 ./rpc_benchmark 1000
 ```
 
-## 12. 可扩展性说明
+## 13. 可扩展性说明
 
 当前代码保持阻塞式最小闭环，但接口设计已为后续扩展预留：
 - `Codec` 可替换为异步读写实现（epoll/io_uring）
 - 客户端已具备轻量 reactor 骨架，可演进为 coroutine 驱动 I/O
 - `RpcServer` 的连接处理可演进为协程调度
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
+
+coroutine API 的后续演进方向：
+- 可将 pending slot 与 coroutine handle 直接绑定，减少 future bridge 成本
+- 可进一步消除 bridge 线程等待路径，降低上下文切换开销
+- 可继续演进为更完整的 coroutine-driven RPC runtime

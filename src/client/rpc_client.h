@@ -12,6 +12,7 @@
 
 #include "client/rpc_types.h"
 #include "common/unique_fd.h"
+#include "coroutine/task.h"
 
 namespace rpc::client {
 
@@ -89,6 +90,13 @@ class RpcClient {
   [[nodiscard]] RpcCallResult Call(std::string_view service_name,
                                    std::string_view method_name,
                                    std::string_view request_payload);
+
+  /// 通用协程 RPC 调用接口
+  ///
+  /// 在现有 CallAsync 之上提供最小 co_await 友好包装层。
+  [[nodiscard]] rpc::coroutine::Task<RpcCallResult> CallCo(
+      std::string_view service_name, std::string_view method_name,
+      std::string_view request_payload);
 
  private:
   /// 生成下一个请求 ID
