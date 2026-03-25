@@ -21,6 +21,32 @@ bool PendingCalls::Add(std::string request_id) {
   return slots_.try_emplace(std::move(request_id)).second;
 }
 
+bool PendingCalls::BindAsync(std::string_view request_id,
+                             std::promise<RpcCallResult> promise,
+                             std::chrono::steady_clock::time_point deadline) {
+  std::scoped_lock lock(mutex_);
+
+  const auto it = slots_.find(std::string(request_id));
+  if (it == slots_.end()) {
+    return false;
+  }
+
+  if (it->second.async_bound) {
+    return false;
+  }
+
+  if (it->second.done) {
+    promise.set_value(std::move(it->second.result));
+    slots_.erase(it);
+    return true;
+  }
+
+  it->second.async_promise.emplace(std::move(promise));
+  it->second.async_bound = true;
+  it->second.deadline = deadline;
+  return true;
+}
+
 /// 完成一个请求并设置结果
 ///
 /// 由 Dispatcher 线程调用。找到对应的槽位，设置结果并唤醒等待者。
@@ -33,11 +59,21 @@ bool PendingCalls::Complete(std::string_view request_id, RpcCallResult result) {
     return false;
   }
 
+  Slot& slot = it->second;
+
   // 设置完成状态和结果
-  it->second.done = true;
-  it->second.result = std::move(result);
-  // 唤醒所有等待该请求的线程
-  it->second.cv.notify_all();
+  slot.done = true;
+  slot.result = std::move(result);
+
+  // 异步请求直接完成 future，并在 pending 表中移除。
+  if (slot.async_promise.has_value()) {
+    slot.async_promise->set_value(slot.result);
+    slots_.erase(it);
+    return true;
+  }
+
+  // 同步等待模式下唤醒等待线程。
+  slot.cv.notify_all();
   return true;
 }
 
@@ -117,8 +153,35 @@ void PendingCalls::FailAll(const RpcCallResult& result_template) {
       slot.done = true;
       slot.result = result_template;
     }
-    // 无论是否已完成，都通知等待线程尽快退出等待。
+    if (slot.async_promise.has_value()) {
+      slot.async_promise->set_value(slot.result);
+      slot.async_promise.reset();
+    }
+
+    // 无论是否已完成，都通知同步等待线程尽快退出等待。
     slot.cv.notify_all();
+  }
+}
+
+void PendingCalls::FailTimedOut(std::chrono::steady_clock::time_point now,
+                                const RpcCallResult& timeout_result) {
+  std::scoped_lock lock(mutex_);
+
+  for (auto it = slots_.begin(); it != slots_.end();) {
+    Slot& slot = it->second;
+    if (!slot.async_bound || slot.done || now < slot.deadline) {
+      ++it;
+      continue;
+    }
+
+    slot.done = true;
+    slot.result = timeout_result;
+
+    if (slot.async_promise.has_value()) {
+      slot.async_promise->set_value(slot.result);
+    }
+
+    it = slots_.erase(it);
   }
 }
 

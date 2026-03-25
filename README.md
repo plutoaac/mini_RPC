@@ -66,7 +66,7 @@
   - 连接服务端
   - 构造并发送 `RpcRequest`
   - 独立 dispatcher 线程持续接收并解析 `RpcResponse`
-  - 按 `request_id` 精确回填到对应等待中的调用
+  - 按 `request_id` 精确完成对应 in-flight 请求（含 async future）
   - 提供 `CallAsync`（future-like 最小版本）
   - 同步 `Call` 基于 `CallAsync().get()` 封装
   - 通过 `Status(std::error_code + message)` 返回统一错误
@@ -74,7 +74,8 @@
 
 - `src/client/pending_calls.*`
   - 维护 `request_id -> result slot` 的线程安全表
-  - 支持 `Add / Complete / Pop / FailAll`
+  - 支持 `Add / BindAsync / Complete / FailTimedOut / FailAll`
+  - dispatcher 线程可直接完成 async promise，不需要每请求 watcher 线程
   - `FailAll` 仅标记未完成槽位，避免覆盖已完成结果（修复关闭连接竞态）
 
 - `src/common/rpc_error.h`
@@ -196,17 +197,18 @@ std::future<RpcCallResult> CallAsync(
 
 - 复用当前 `request_id + PendingCalls + dispatcher` 主链路
 - `CallAsync` 负责发请求并返回 `future`
-- 使用轻量等待线程桥接 `PendingCalls::WaitAndPop(...) -> promise.set_value(...)`
+- `CallAsync` 在 PendingCalls 注册 async 等待状态（promise + deadline）
+- dispatcher 收到响应后直接按 `request_id` 完成 promise
 - 同步 `Call` 改为 `CallAsync(...).get()`，保持现有调用行为
 
 定位说明：
 
-- 这是一个“最小可工作”过渡版，目标是先打通异步接口并保持代码可学习
-- 后续可演进为 coroutine/awaitable 版本，减少每请求一个等待线程的开销
+- 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下去掉 per-call watcher 线程
+- 当前结构已为后续 coroutine/awaitable 版本铺路
 
 ## 10. 测试
 
-本项目已提供 6 类可重复执行测试：
+本项目已提供 7 类可重复执行测试：
 
 - `codec_test`：协议层
   - 正常 encode/decode
@@ -238,6 +240,10 @@ std::future<RpcCallResult> CallAsync(
   - 多个 `CallAsync` 并发请求中，单个慢请求超时返回
   - 验证其他请求仍可成功返回，不被超时请求污染
 
+- `call_async_close_test`：关闭连接后的异步收敛
+  - `Close()` 后未完成的 async future 必须收到失败结果
+  - 验证不会出现 future 永远不完成
+
 运行方式：
 
 ```bash
@@ -252,7 +258,7 @@ ctest --output-on-failure
 
 ```bash
 cd rpc_project/build
-ctest --output-on-failure -R 'out_of_order_dispatcher_test|call_async_timeout_test'
+ctest --output-on-failure -R 'out_of_order_dispatcher_test|call_async_timeout_test|call_async_close_test'
 ```
 
 ## 11. Benchmark

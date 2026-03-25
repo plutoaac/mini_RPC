@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -14,8 +15,9 @@ namespace rpc::client {
 
 /// RPC 调用请求管理器
 ///
-/// PendingCalls 用于管理进行中的 RPC 调用请求，维护 request_id 到结果槽位的映射。
-/// 它是 RPC 客户端实现"调用线程等待 + 响应线程分发"并发模型的核心组件。
+/// PendingCalls 用于管理进行中的 RPC 调用请求，维护 request_id
+/// 到结果槽位的映射。 它是 RPC 客户端实现"调用线程等待 +
+/// 响应线程分发"并发模型的核心组件。
 ///
 /// 设计模式：
 /// - 每个 RPC 调用创建一个 Slot，包含完成状态、结果和条件变量
@@ -46,6 +48,14 @@ class PendingCalls {
   /// @param request_id 请求唯一标识符
   /// @return 添加成功返回 true，失败（重复或空 ID）返回 false
   [[nodiscard]] bool Add(std::string request_id);
+
+  /// 绑定异步等待者
+  ///
+  /// 为已存在的请求槽位绑定 promise 与超时信息。
+  /// 若响应已先到达，会立即完成 promise 并移除槽位。
+  [[nodiscard]] bool BindAsync(std::string_view request_id,
+                               std::promise<RpcCallResult> promise,
+                               std::chrono::steady_clock::time_point deadline);
 
   /// 完成一个请求并设置结果
   ///
@@ -96,6 +106,12 @@ class PendingCalls {
   /// @param result_template 失败结果模板，将应用于所有请求
   void FailAll(const RpcCallResult& result_template);
 
+  /// 使已到 deadline 的异步请求失败
+  ///
+  /// 由 dispatcher 在读超时分支中调用，避免每请求一个等待线程。
+  void FailTimedOut(std::chrono::steady_clock::time_point now,
+                    const RpcCallResult& timeout_result);
+
   /// 获取当前待处理请求数量
   ///
   /// @return 当前槽位数量
@@ -113,6 +129,12 @@ class PendingCalls {
     RpcCallResult result;
     /// 条件变量，用于阻塞等待响应
     std::condition_variable cv;
+    /// 异步 promise（存在时表示该请求由 CallAsync 等待）
+    std::optional<std::promise<RpcCallResult>> async_promise;
+    /// 是否已绑定异步等待者
+    bool async_bound{false};
+    /// 异步请求的 deadline（仅 async_bound=true 时有效）
+    std::chrono::steady_clock::time_point deadline{};
   };
 
   /// 互斥锁，保护 slots_ 的并发访问

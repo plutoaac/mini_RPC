@@ -119,6 +119,18 @@ if(BUILD_TESTING)
 
     add_test(NAME call_async_timeout_test COMMAND call_async_timeout_test)
 
+    add_executable(call_async_close_test
+        tests/call_async_close_test.cpp
+    )
+
+    target_link_libraries(call_async_close_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_async_close_test COMMAND call_async_close_test)
+
     add_executable(pending_calls_test
         tests/pending_calls_test.cpp
     )

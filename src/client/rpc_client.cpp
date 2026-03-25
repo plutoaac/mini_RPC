@@ -48,6 +48,12 @@ bool SetSocketTimeout(int fd, int optname, std::chrono::milliseconds timeout,
   return true;
 }
 
+bool IsTemporaryReadFailure(std::string_view read_error) {
+  return read_error.find("Resource temporarily unavailable") !=
+             std::string_view::npos ||
+         read_error.find("recv timeout") != std::string_view::npos;
+}
+
 }  // namespace
 
 RpcClient::RpcClient(std::string host, std::uint16_t port,
@@ -96,6 +102,12 @@ bool RpcClient::Connect() {
     return false;
   }
 
+  if (!SetSocketTimeout(conn_fd.Get(), SO_RCVTIMEO, options_.recv_timeout,
+                        &timeout_error)) {
+    common::LogError(timeout_error);
+    return false;
+  }
+
   sock_ = std::move(conn_fd);
   dispatcher_running_.store(true);
   dispatcher_thread_ = std::thread(&RpcClient::DispatcherLoop, this);
@@ -139,7 +151,8 @@ std::string RpcClient::NextRequestId() {
 /// 通用 RPC 异步调用接口
 ///
 /// 执行一次完整的 RPC 调用流程：建立连接 → 发送请求 → 异步等待响应。
-/// 当前为最小桥接版：通过轻量等待线程将 pending table 的结果写入 future。
+/// 当前实现由 dispatcher 线程按 request_id 直接完成 future，无额外 watcher
+/// 线程。
 std::future<RpcCallResult> RpcClient::CallAsync(
     std::string_view service_name, std::string_view method_name,
     std::string_view request_payload) {
@@ -185,22 +198,15 @@ std::future<RpcCallResult> RpcClient::CallAsync(
   std::promise<RpcCallResult> promise;
   auto future = promise.get_future();
 
-  auto pending = pending_calls_;
-  const auto timeout = options_.recv_timeout;
-  std::thread([pending, request_id = std::move(request_id), timeout,
-               promise = std::move(promise)]() mutable {
-    const auto completed = pending->WaitAndPop(request_id, timeout);
-    if (!completed.has_value()) {
-      pending->Remove(request_id);
-      promise.set_value(RpcCallResult{
-          {common::make_error_code(common::ErrorCode::kInternalError),
-           "call timeout"},
-          {}});
-      return;
-    }
-
-    promise.set_value(*completed);
-  }).detach();
+  const auto deadline =
+      std::chrono::steady_clock::now() + options_.recv_timeout;
+  if (!pending_calls_->BindAsync(request_id, std::move(promise), deadline)) {
+    pending_calls_->Remove(request_id);
+    return MakeReadyFuture(RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "bind async waiter failed"},
+        {}});
+  }
 
   return future;
 }
@@ -246,9 +252,13 @@ void RpcClient::DispatcherLoop() {
 
       // 如果是临时性错误（资源暂时不可用或接收超时），继续循环重试
       // 这些是非阻塞模式下的正常情况，不是真正的错误
-      if (read_error.find("Resource temporarily unavailable") !=
-              std::string::npos ||
-          read_error.find("recv timeout") != std::string::npos) {
+      if (IsTemporaryReadFailure(read_error)) {
+        pending_calls_->FailTimedOut(
+            std::chrono::steady_clock::now(),
+            RpcCallResult{
+                {common::make_error_code(common::ErrorCode::kInternalError),
+                 "call timeout"},
+                {}});
         continue;
       }
 
