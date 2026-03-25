@@ -7,8 +7,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -174,36 +174,26 @@ int main() {
        .recv_timeout = std::chrono::milliseconds(2000)});
 
   std::vector<int> results(static_cast<std::size_t>(kConcurrentCalls), -1);
-  std::vector<std::thread> workers;
-  workers.reserve(kConcurrentCalls);
-
-  std::mutex finish_mu;
-  std::vector<int> finish_order;
-  finish_order.reserve(kConcurrentCalls);
+  std::vector<std::future<rpc::client::RpcCallResult>> futures;
+  futures.reserve(kConcurrentCalls);
 
   for (int i = 0; i < kConcurrentCalls; ++i) {
-    workers.emplace_back([&client, &results, &finish_mu, &finish_order, i]() {
-      calc::AddRequest req;
-      req.set_a(i);
-      req.set_b(1000);
+    calc::AddRequest req;
+    req.set_a(i);
+    req.set_b(1000);
 
-      std::string payload;
-      assert(req.SerializeToString(&payload));
-
-      const auto res = client.Call("CalcService", "Add", payload);
-      assert(res.ok());
-
-      calc::AddResponse resp;
-      assert(resp.ParseFromString(res.response_payload));
-      results[static_cast<std::size_t>(i)] = resp.result();
-
-      std::scoped_lock lock(finish_mu);
-      finish_order.push_back(i);
-    });
+    std::string payload;
+    assert(req.SerializeToString(&payload));
+    futures.emplace_back(client.CallAsync("CalcService", "Add", payload));
   }
 
-  for (auto& worker : workers) {
-    worker.join();
+  for (int i = 0; i < kConcurrentCalls; ++i) {
+    const auto res = futures[static_cast<std::size_t>(i)].get();
+    assert(res.ok());
+
+    calc::AddResponse resp;
+    assert(resp.ParseFromString(res.response_payload));
+    results[static_cast<std::size_t>(i)] = resp.result();
   }
 
   int child_status = 0;
@@ -213,21 +203,6 @@ int main() {
 
   for (int i = 0; i < kConcurrentCalls; ++i) {
     assert(results[static_cast<std::size_t>(i)] == i + 1000);
-  }
-
-  bool strictly_increasing_finish = true;
-  for (std::size_t i = 1; i < finish_order.size(); ++i) {
-    if (finish_order[i] < finish_order[i - 1]) {
-      strictly_increasing_finish = false;
-      break;
-    }
-  }
-
-  // 在模拟乱序服务端下，完成顺序通常不会严格递增；
-  // 若偶发递增，不影响核心正确性验证（request_id 精确匹配）。
-  if (strictly_increasing_finish) {
-    std::cerr
-        << "warning: completion order happened to be increasing in this run\n";
   }
 
   std::cout << "out_of_order_dispatcher_test passed\n";

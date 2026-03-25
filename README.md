@@ -14,6 +14,7 @@
 - 阻塞式 TCP 通信
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
+- 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
 - 基于 `std::error_code` 的统一错误体系
 - 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
 - 基于 `std::source_location` 的轻量结构化日志
@@ -66,6 +67,8 @@
   - 构造并发送 `RpcRequest`
   - 独立 dispatcher 线程持续接收并解析 `RpcResponse`
   - 按 `request_id` 精确回填到对应等待中的调用
+  - 提供 `CallAsync`（future-like 最小版本）
+  - 同步 `Call` 基于 `CallAsync().get()` 封装
   - 通过 `Status(std::error_code + message)` 返回统一错误
   - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
 
@@ -178,9 +181,32 @@ rpc::client::RpcClient client(
 
 说明：当前版本基于 `SO_SNDTIMEO` / `SO_RCVTIMEO`，后续可升级到更细粒度的 per-request deadline。
 
-## 9. 测试
+## 9. CallAsync（future-like 最小版本）
 
-本项目已提供 5 类可重复执行测试：
+客户端已提供最小异步接口：
+
+```cpp
+std::future<RpcCallResult> CallAsync(
+  std::string_view service_name,
+  std::string_view method_name,
+  std::string_view request_payload);
+```
+
+实现要点：
+
+- 复用当前 `request_id + PendingCalls + dispatcher` 主链路
+- `CallAsync` 负责发请求并返回 `future`
+- 使用轻量等待线程桥接 `PendingCalls::WaitAndPop(...) -> promise.set_value(...)`
+- 同步 `Call` 改为 `CallAsync(...).get()`，保持现有调用行为
+
+定位说明：
+
+- 这是一个“最小可工作”过渡版，目标是先打通异步接口并保持代码可学习
+- 后续可演进为 coroutine/awaitable 版本，减少每请求一个等待线程的开销
+
+## 10. 测试
+
+本项目已提供 6 类可重复执行测试：
 
 - `codec_test`：协议层
   - 正常 encode/decode
@@ -205,8 +231,12 @@ rpc::client::RpcClient client(
 
 - `out_of_order_dispatcher_test`：乱序响应分发
   - 服务端故意按请求接收顺序的逆序返回响应
-  - 验证客户端 dispatcher 通过 `request_id` 正确匹配结果
+  - 验证客户端 `CallAsync` 在乱序响应下通过 `request_id` 正确匹配结果
   - 覆盖“连接关闭 + 已完成结果”竞态场景
+
+- `call_async_timeout_test`：异步超时隔离
+  - 多个 `CallAsync` 并发请求中，单个慢请求超时返回
+  - 验证其他请求仍可成功返回，不被超时请求污染
 
 运行方式：
 
@@ -222,10 +252,10 @@ ctest --output-on-failure
 
 ```bash
 cd rpc_project/build
-ctest --output-on-failure -R '^out_of_order_dispatcher_test$'
+ctest --output-on-failure -R 'out_of_order_dispatcher_test|call_async_timeout_test'
 ```
 
-## 10. Benchmark
+## 11. Benchmark
 
 提供单连接基准程序 `rpc_benchmark`，默认执行 1000 次 Add 调用，输出：
 
@@ -240,7 +270,7 @@ cd rpc_project/build
 ./rpc_benchmark 1000
 ```
 
-## 可扩展性说明
+## 12. 可扩展性说明
 
 当前代码保持阻塞式最小闭环，但接口设计已为后续扩展预留：
 - `Codec` 可替换为异步读写实现（epoll/io_uring）

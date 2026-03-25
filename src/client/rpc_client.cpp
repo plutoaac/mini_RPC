@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -18,6 +19,13 @@
 namespace rpc::client {
 
 namespace {
+
+std::future<RpcCallResult> MakeReadyFuture(RpcCallResult result) {
+  std::promise<RpcCallResult> promise;
+  auto future = promise.get_future();
+  promise.set_value(std::move(result));
+  return future;
+}
 
 bool SetSocketTimeout(int fd, int optname, std::chrono::milliseconds timeout,
                       std::string* error_msg) {
@@ -48,7 +56,7 @@ RpcClient::RpcClient(std::string host, std::uint16_t port,
       port_(port),
       options_(options),
       next_id_(0),
-      pending_calls_(std::make_unique<PendingCalls>()) {}
+      pending_calls_(std::make_shared<PendingCalls>()) {}
 
 RpcClient::~RpcClient() { Close(); }
 
@@ -128,31 +136,26 @@ std::string RpcClient::NextRequestId() {
   return std::to_string(id);
 }
 
-/// 通用 RPC 调用接口
+/// 通用 RPC 异步调用接口
 ///
-/// 执行一次完整的 RPC 调用流程：建立连接 → 发送请求 → 等待响应 → 返回结果。
-/// 使用 pending_calls_ 管理请求状态，为未来的异步调用模式预留扩展点。
-///
-/// @param service_name 服务名称（如 "Calculator"）
-/// @param method_name 方法名称（如 "Add"）
-/// @param request_payload 业务请求的 protobuf 序列化数据
-/// @return RpcCallResult 包含调用状态和响应数据
-RpcCallResult RpcClient::Call(std::string_view service_name,
-                              std::string_view method_name,
-                              std::string_view request_payload) {
+/// 执行一次完整的 RPC 调用流程：建立连接 → 发送请求 → 异步等待响应。
+/// 当前为最小桥接版：通过轻量等待线程将 pending table 的结果写入 future。
+std::future<RpcCallResult> RpcClient::CallAsync(
+    std::string_view service_name, std::string_view method_name,
+    std::string_view request_payload) {
   if (!Connect()) {
-    return RpcCallResult{
+    return MakeReadyFuture(RpcCallResult{
         {common::make_error_code(common::ErrorCode::kInternalError),
          "connect failed"},
-        {}};
+        {}});
   }
 
   const std::string request_id = NextRequestId();
   if (!pending_calls_->Add(request_id)) {
-    return RpcCallResult{
+    return MakeReadyFuture(RpcCallResult{
         {common::make_error_code(common::ErrorCode::kInternalError),
          "duplicate request_id in pending table"},
-        {}};
+        {}});
   }
 
   rpc::RpcRequest request;
@@ -175,21 +178,37 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
       (void)pending_calls_->Complete(request_id, result);
       auto popped = pending_calls_->TryPop(request_id);
       Close();
-      return popped.value_or(result);
+      return MakeReadyFuture(popped.value_or(result));
     }
   }
 
-  const auto completed =
-      pending_calls_->WaitAndPop(request_id, options_.recv_timeout);
-  if (!completed.has_value()) {
-    pending_calls_->Remove(request_id);
-    return RpcCallResult{
-        {common::make_error_code(common::ErrorCode::kInternalError),
-         "call timeout"},
-        {}};
-  }
+  std::promise<RpcCallResult> promise;
+  auto future = promise.get_future();
 
-  return *completed;
+  auto pending = pending_calls_;
+  const auto timeout = options_.recv_timeout;
+  std::thread([pending, request_id = std::move(request_id), timeout,
+               promise = std::move(promise)]() mutable {
+    const auto completed = pending->WaitAndPop(request_id, timeout);
+    if (!completed.has_value()) {
+      pending->Remove(request_id);
+      promise.set_value(RpcCallResult{
+          {common::make_error_code(common::ErrorCode::kInternalError),
+           "call timeout"},
+          {}});
+      return;
+    }
+
+    promise.set_value(*completed);
+  }).detach();
+
+  return future;
+}
+
+RpcCallResult RpcClient::Call(std::string_view service_name,
+                              std::string_view method_name,
+                              std::string_view request_payload) {
+  return CallAsync(service_name, method_name, request_payload).get();
 }
 
 /// RPC 响应分发循环

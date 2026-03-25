@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -83,6 +84,15 @@ int main() {
   assert(add_resp.ParseFromString(add_res.response_payload));
   assert(add_resp.result() == 3);
 
+  // 异步调用基本成功。
+  auto add_future = client.CallAsync("CalcService", "Add", add_payload);
+  const auto add_async_res = add_future.get();
+  assert(add_async_res.ok());
+
+  calc::AddResponse add_async_resp;
+  assert(add_async_resp.ParseFromString(add_async_res.response_payload));
+  assert(add_async_resp.result() == 3);
+
   const auto missing_res =
       client.Call("CalcService", "NoSuchMethod", add_payload);
   assert(!missing_res.ok());
@@ -114,6 +124,28 @@ int main() {
 
   for (auto& w : workers) {
     w.join();
+  }
+
+  // 并发异步调用验证：先全部发起，再统一 get。
+  std::vector<std::future<rpc::client::RpcCallResult>> futures;
+  futures.reserve(kConcurrent);
+  for (int i = 0; i < kConcurrent; ++i) {
+    calc::AddRequest req;
+    req.set_a(i);
+    req.set_b(100);
+
+    std::string payload;
+    assert(req.SerializeToString(&payload));
+    futures.emplace_back(client.CallAsync("CalcService", "Add", payload));
+  }
+
+  for (int i = 0; i < kConcurrent; ++i) {
+    const auto res = futures[static_cast<std::size_t>(i)].get();
+    assert(res.ok());
+
+    calc::AddResponse resp;
+    assert(resp.ParseFromString(res.response_payload));
+    assert(resp.result() == i + 100);
   }
 
   ::kill(pid, SIGTERM);

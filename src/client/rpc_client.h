@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,6 +73,18 @@ class RpcClient {
   /// @param method_name 方法名称，如 "Add"
   /// @param request_payload 业务请求 protobuf 序列化后的二进制数据
   /// @return RpcCallResult 包含调用状态和响应数据
+  [[nodiscard]] std::future<RpcCallResult> CallAsync(
+      std::string_view service_name, std::string_view method_name,
+      std::string_view request_payload);
+
+  /// 通用同步 RPC 调用接口
+  ///
+  /// 当前实现基于 CallAsync().get() 封装。
+  ///
+  /// @param service_name 服务名称，如 "Calculator"
+  /// @param method_name 方法名称，如 "Add"
+  /// @param request_payload 业务请求 protobuf 序列化后的二进制数据
+  /// @return RpcCallResult 包含调用状态和响应数据
   [[nodiscard]] RpcCallResult Call(std::string_view service_name,
                                    std::string_view method_name,
                                    std::string_view request_payload);
@@ -98,7 +111,7 @@ class RpcClient {
   std::atomic<bool> dispatcher_running_{false};
   /// 下一个请求 ID，原子变量保证线程安全的递增
   std::atomic<std::uint64_t> next_id_;
-  std::unique_ptr<PendingCalls> pending_calls_;
+  std::shared_ptr<PendingCalls> pending_calls_;
 };
 
 }  // namespace rpc::client
