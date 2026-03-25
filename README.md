@@ -18,9 +18,10 @@
 - 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
 - 基于 `std::source_location` 的轻量结构化日志
 - 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
+- 客户端读写分工模型（调用线程发送 + dispatcher 线程按 `request_id` 分发响应）
 - 自动化测试入口（协议层、注册中心、端到端）
 - Benchmark 入口（单连接延迟与吞吐）
-- PendingCalls 雏形（`request_id -> result slot`）
+- PendingCalls（`request_id -> result slot`）与连接关闭竞态保护
 
 ## 2. 架构说明
 
@@ -63,14 +64,15 @@
 - `src/client/rpc_client.*`
   - 连接服务端
   - 构造并发送 `RpcRequest`
-  - 接收并解析 `RpcResponse`
+  - 独立 dispatcher 线程持续接收并解析 `RpcResponse`
+  - 按 `request_id` 精确回填到对应等待中的调用
   - 通过 `Status(std::error_code + message)` 返回统一错误
-  - 通过 `PendingCalls` 进行请求与响应关联（为多 in-flight 扩展铺垫）
+  - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
 
 - `src/client/pending_calls.*`
   - 维护 `request_id -> result slot` 的线程安全表
   - 支持 `Add / Complete / Pop / FailAll`
-  - 当前用于串行调用结构铺垫，后续可升级为 promise/future 模式
+  - `FailAll` 仅标记未完成槽位，避免覆盖已完成结果（修复关闭连接竞态）
 
 - `src/common/rpc_error.h`
   - 定义框架错误枚举与 `std::error_code` category
@@ -178,7 +180,7 @@ rpc::client::RpcClient client(
 
 ## 9. 测试
 
-本项目已提供 3 类可重复执行测试：
+本项目已提供 5 类可重复执行测试：
 
 - `codec_test`：协议层
   - 正常 encode/decode
@@ -201,6 +203,11 @@ rpc::client::RpcClient client(
   - FailAll 行为
   - 并发 Add/Complete/Pop 基础正确性
 
+- `out_of_order_dispatcher_test`：乱序响应分发
+  - 服务端故意按请求接收顺序的逆序返回响应
+  - 验证客户端 dispatcher 通过 `request_id` 正确匹配结果
+  - 覆盖“连接关闭 + 已完成结果”竞态场景
+
 运行方式：
 
 ```bash
@@ -209,6 +216,13 @@ cmake -S . -B build
 cmake --build build -j
 cd build
 ctest --output-on-failure
+```
+
+仅运行乱序测试：
+
+```bash
+cd rpc_project/build
+ctest --output-on-failure -R '^out_of_order_dispatcher_test$'
 ```
 
 ## 10. Benchmark
