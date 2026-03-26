@@ -8,8 +8,11 @@
 
 本阶段已从纯阻塞式客户端分发循环，演进到轻量 event loop / reactor 雏形。
 
-当前版本已在现有 async client 底层之上新增最小 coroutine API（`CallCo` + `Task<T>`），
-用于提供 `co_await` 编程体验，不改变现有 I/O 与分发模型。
+当前版本已将 coroutine API 从“future bridge”升级为“direct waiter”模式：
+- `PendingCalls` 支持 coroutine waiter（协程句柄 + deadline）
+- dispatcher 收到响应后按 `request_id` 直接恢复对应协程
+
+在不推翻现有 async/event-loop 架构的前提下，`CallCo` 已不再依赖 `co_await CallAsync(...)`。
 
 ## 1. 项目介绍
 
@@ -75,7 +78,7 @@
   - 非阻塞读取并解析长度前缀响应帧
   - 按 `request_id` 精确完成对应 in-flight 请求（含 async future）
   - 提供 `CallAsync`（future-like 最小版本）
-  - 提供 `CallCo`（coroutine 最小桥接层）
+  - 提供 `CallCo`（coroutine direct waiter，非 future bridge）
   - 同步 `Call` 基于 `CallAsync().get()` 封装
   - 通过 `Status(std::error_code + message)` 返回统一错误
   - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
@@ -87,8 +90,10 @@
 
 - `src/client/pending_calls.*`
   - 维护 `request_id -> result slot` 的线程安全表
-  - 支持 `Add / BindAsync / Complete / FailTimedOut / FailAll`
+  - 支持 `Add / BindAsync / BindCoroutine / Complete / FailTimedOut / FailAll`
+  - 同时管理 future waiter 与 coroutine waiter
   - dispatcher 线程可直接完成 async promise，不需要每请求 watcher 线程
+  - dispatcher 线程可直接恢复 coroutine waiter（按 request_id）
   - `FailAll` 仅标记未完成槽位，避免覆盖已完成结果（修复关闭连接竞态）
 
 - `src/common/rpc_error.h`
@@ -219,7 +224,7 @@ std::future<RpcCallResult> CallAsync(
 - 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下引入 reactor 思路
 - 当前结构已为后续 coroutine/awaitable 版本铺路（I/O readiness 与完成分发职责已分层）
 
-## 10. CallCo（最小 coroutine 接口层）
+## 10. CallCo（direct coroutine waiter）
 
 客户端新增了 coroutine 友好接口：
 
@@ -245,9 +250,17 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 定位说明：
 
-- coroutine 层是增量包装层，复用现有 `CallAsync + PendingCalls + dispatcher/event loop`
-- 当前版本主要提升调用侧编程模型，不引入完整 coroutine runtime
-- bridge 方式仍有额外 future/awaiter 开销，但实现简单且便于学习
+- `CallCo` 直接走 `request_id + PendingCalls + dispatcher/event loop` 主链路
+- 协程在 `await_suspend` 阶段把句柄绑定到 pending slot
+- 响应到达后 dispatcher 通过 `Complete(request_id, ...)` 直接 `resume()` 对应协程
+- 超时与 `Close()` 失败收敛路径同样会恢复等待中的协程，避免永久挂起
+- 仍保持“小步演进”风格，不引入完整 coroutine runtime
+
+这一步相对“简单包装 CallAsync”的提升：
+
+- 去掉了 `future -> awaiter` 的桥接等待线程路径
+- 协程等待与 request_id 映射直接对齐，可读性和可调试性更好
+- 为后续 coroutine-driven runtime 与更强事件驱动奠定接口基础
 
 可运行示例：
 
@@ -257,7 +270,7 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 ## 11. 测试
 
-本项目已提供 12 类可重复执行测试：
+本项目已提供 13 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -313,6 +326,11 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 - `call_co_close_test`：coroutine 连接关闭收敛
   - `Close()` 后未完成 coroutine 调用返回失败结果
 
+- `call_mixed_waiters_test`：future 与 coroutine waiter 共存
+  - 同一连接并发混合 `CallAsync` 与 `CallCo`
+  - 服务端乱序返回响应，验证两种 waiter 均按 request_id 正确匹配
+  - 验证两条路径互不污染
+
 运行方式：
 
 ```bash
@@ -361,6 +379,6 @@ cd rpc_project/build
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
 
 coroutine API 的后续演进方向：
-- 可将 pending slot 与 coroutine handle 直接绑定，减少 future bridge 成本
-- 可进一步消除 bridge 线程等待路径，降低上下文切换开销
-- 可继续演进为更完整的 coroutine-driven RPC runtime
+- 进一步减少 bridge 残余路径与对象复制开销
+- 演进为更完整的 coroutine-driven RPC runtime（调度与取消语义）
+- 可继续探索 io_uring / 更强事件驱动模型

@@ -1,0 +1,52 @@
+Step 1: 调用 CallCo()，创建 CallCo 协程
+        │
+        ├─ CallCo 协程开始执行
+        │     │
+        │     ├─ 发送请求
+        │     └─ co_await DirectCallCoAwaiter → CallCo 挂起
+        │
+        └─ 返回 Task<RpcCallResult> 对象
+
+Step 2: 用户代码 co_await Task
+        │
+        ├─ Task::operator co_await() ← 【Task::Awaiter 开始执行】
+        │     │
+        │     └─ 返回 Task::Awaiter{handle_}
+        │
+        ├─ Task::Awaiter::await_ready()
+        │     └─ 检查 future 是否 ready
+        │           └─ 此时 CallCo 挂起中，返回 false
+        │
+        ├─ Task::Awaiter::await_suspend(RunDemo句柄)
+        │     │
+        │     └─ promise.continuation = RunDemo句柄  ← 保存调用者
+        │           └─ 返回 true
+        │
+        └─ RunDemo 协程挂起
+
+        ... 等待响应 ...
+
+Step 3: Dispatcher 收到响应，resume CallCo
+        │
+        ├─ CallCo 协程恢复
+        │     │
+        │     └─ co_return result
+        │           │
+        │           └─ promise.return_value(result)
+        │
+        └─ final_suspend() ← 【FinalAwaiter 开始执行】
+              │
+              ├─ FinalAwaiter::await_ready() → false
+              │
+              ├─ FinalAwaiter::await_suspend()
+              │     │
+              │     ├─ PublishCompletion() → future 变为 ready
+              │     │
+              │     └─ return continuation  ← 返回 RunDemo 句柄
+              │           │
+              │           └─ 对称转移：恢复 RunDemo
+              │
+              └─ RunDemo 协程恢复
+                    │
+                    └─ Task::Awaiter::await_resume()
+                          └─ future.get() 返回结果

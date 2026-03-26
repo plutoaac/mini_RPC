@@ -201,6 +201,18 @@ if(BUILD_TESTING)
 
     add_test(NAME call_co_close_test COMMAND call_co_close_test)
 
+    add_executable(call_mixed_waiters_test
+        tests/call_mixed_waiters_test.cpp
+    )
+
+    target_link_libraries(call_mixed_waiters_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_mixed_waiters_test COMMAND call_mixed_waiters_test)
+
     add_executable(pending_calls_test
         tests/pending_calls_test.cpp
     )
@@ -212,6 +224,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME pending_calls_test COMMAND pending_calls_test)
+
+    add_executable(call_co_edge_cases_test
+        tests/call_co_edge_cases_test.cpp
+    )
+
+    target_link_libraries(call_co_edge_cases_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME call_co_edge_cases_test COMMAND call_co_edge_cases_test)
 endif()
 
 add_executable(rpc_benchmark

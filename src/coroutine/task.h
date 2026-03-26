@@ -32,6 +32,7 @@
 #include <coroutine>
 #include <exception>
 #include <future>
+#include <optional>
 #include <utility>
 
 namespace rpc::coroutine {
@@ -61,6 +62,9 @@ class Task {
     std::shared_future<T>
         completion_future;                 ///< 用于获取协程结果（可多次获取）
     std::coroutine_handle<> continuation;  ///< 调用者协程句柄（用于恢复调用者）
+    std::optional<T> result_value;         ///< 暂存 co_return 值，final_suspend 再发布
+    std::exception_ptr unhandled_error;    ///< 暂存未捕获异常，final_suspend 再发布
+    bool completion_set{false};            ///< 防止重复 set_value/set_exception
 
     /// @brief 构造函数，初始化 shared_future
     promise_type()
@@ -90,11 +94,18 @@ class Task {
       ///
       /// 当协程执行完毕后，如果有 continuation（调用者在 await 此协程），
       /// 则恢复调用者的执行。
-      void await_suspend(std::coroutine_handle<promise_type> handle) noexcept {
-        auto continuation = handle.promise().continuation;
+      std::coroutine_handle<> await_suspend(
+          std::coroutine_handle<promise_type> handle) noexcept {
+        auto& promise = handle.promise();
+        promise.PublishCompletion();
+
+        auto continuation = promise.continuation;
+        // 对称转移：避免在当前协程 final_suspend 栈帧内直接 resume continuation
+        // 造成重入销毁协程帧的未定义行为。
         if (continuation) {
-          continuation.resume();
+          return continuation;
         }
+        return std::noop_coroutine();
       }
 
       /// @brief 恢复时无操作
@@ -111,14 +122,28 @@ class Task {
     /// 当协程执行 co_return value 时，编译器调用此方法。
     /// 将值设置到 promise 中，使得等待者可以通过 future 获取结果。
     void return_value(T value) {
-      completion_promise.set_value(std::move(value));
+      result_value = std::move(value);
     }
 
     /// @brief 处理协程中的未捕获异常
     ///
     /// 异常会被存储到 promise 中，等待者获取结果时会重新抛出。
     void unhandled_exception() {
-      completion_promise.set_exception(std::current_exception());
+      unhandled_error = std::current_exception();
+    }
+
+    void PublishCompletion() noexcept {
+      if (completion_set) {
+        return;
+      }
+      completion_set = true;
+
+      if (unhandled_error != nullptr) {
+        completion_promise.set_exception(unhandled_error);
+        return;
+      }
+
+      completion_promise.set_value(std::move(*result_value));
     }
   };
 
@@ -209,15 +234,21 @@ class Task {
  private:
   /// @brief 重置 Task，销毁关联的协程
   ///
-  /// 在销毁协程前，必须确保协程已执行完毕（通过等待 future）。
-  /// 这是为了避免销毁正在执行的协程导致未定义行为。
+  /// 在销毁协程前，检查协程是否已执行完毕。
+  /// 如果协程已完成，直接销毁协程帧。
+  /// 如果协程未完成（不应该发生），等待其完成。
   void Reset() {
     if (!handle_) {
       return;
     }
 
-    // 确保协程执行完毕
-    handle_.promise().completion_future.wait();
+    // 检查协程是否已完成
+    if (handle_.promise().completion_future.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready) {
+      // 协程未完成，等待（阻塞）
+      // 注意：这可能导致死锁，如果协程永远不完成
+      handle_.promise().completion_future.wait();
+    }
     // 销毁协程帧
     handle_.destroy();
     handle_ = {};
@@ -239,6 +270,8 @@ class Task<void> {
     std::promise<void> completion_promise;
     std::shared_future<void> completion_future;
     std::coroutine_handle<> continuation;
+    std::exception_ptr unhandled_error;
+    bool completion_set{false};
 
     promise_type()
         : completion_future(completion_promise.get_future().share()) {}
@@ -252,11 +285,18 @@ class Task<void> {
     struct FinalAwaiter {
       bool await_ready() const noexcept { return false; }
 
-      void await_suspend(std::coroutine_handle<promise_type> handle) noexcept {
-        auto continuation = handle.promise().continuation;
+      std::coroutine_handle<> await_suspend(
+          std::coroutine_handle<promise_type> handle) noexcept {
+        auto& promise = handle.promise();
+        promise.PublishCompletion();
+
+        auto continuation = promise.continuation;
+        // 对称转移：避免在当前协程 final_suspend 栈帧内直接 resume continuation
+        // 造成重入销毁协程帧的未定义行为。
         if (continuation) {
-          continuation.resume();
+          return continuation;
         }
+        return std::noop_coroutine();
       }
 
       void await_resume() const noexcept {}
@@ -265,10 +305,24 @@ class Task<void> {
     FinalAwaiter final_suspend() noexcept { return {}; }
 
     /// @brief 处理 co_return; 或协程体执行完毕
-    void return_void() { completion_promise.set_value(); }
+    void return_void() {}
 
     void unhandled_exception() {
-      completion_promise.set_exception(std::current_exception());
+      unhandled_error = std::current_exception();
+    }
+
+    void PublishCompletion() noexcept {
+      if (completion_set) {
+        return;
+      }
+      completion_set = true;
+
+      if (unhandled_error != nullptr) {
+        completion_promise.set_exception(unhandled_error);
+        return;
+      }
+
+      completion_promise.set_value();
     }
   };
 
@@ -324,12 +378,21 @@ class Task<void> {
   void Get() { handle_.promise().completion_future.get(); }
 
  private:
+  /// @brief 重置 Task，销毁关联的协程
+  ///
+  /// 在销毁协程前，检查协程是否已执行完毕。
   void Reset() {
     if (!handle_) {
       return;
     }
 
-    handle_.promise().completion_future.wait();
+    // 检查协程是否已完成
+    if (handle_.promise().completion_future.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready) {
+      // 协程未完成，等待（阻塞）
+      handle_.promise().completion_future.wait();
+    }
+    // 销毁协程帧
     handle_.destroy();
     handle_ = {};
   }

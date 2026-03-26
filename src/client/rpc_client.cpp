@@ -6,8 +6,10 @@
 
 #include <cerrno>
 #include <chrono>
+#include <coroutine>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -15,7 +17,6 @@
 #include "client/event_loop.h"
 #include "client/pending_calls.h"
 #include "common/log.h"
-#include "coroutine/future_awaiter.h"
 #include "protocol/codec.h"
 
 namespace rpc::client {
@@ -111,6 +112,168 @@ bool HandleReadableFrames(std::string* read_buffer,
   return true;
 }
 
+/// @brief 协程式 RPC 调用的 Awaiter
+///
+/// DirectCallCoAwaiter 是 C++20 协程 Awaiter 模式的实现，用于支持
+/// `co_await rpc_client.CallCo(...)` 语法。它将 RPC 调用的异步等待
+/// 过程封装成协程可挂起/恢复的形式。
+///
+/// ## 工作流程
+///
+/// 1. CallCo() 发起请求后，创建 DirectCallCoAwaiter 并 co_await 它
+/// 2. 编译器调用 await_ready()，决定是否需要挂起协程
+/// 3. 如果需要挂起，编译器调用 await_suspend()，传入当前协程句柄
+/// 4. await_suspend() 将句柄注册到 PendingCalls，等待响应
+/// 5. Dispatcher 收到响应后，从 PendingCalls 取出句柄并 resume()
+/// 6. 协程恢复，执行 await_resume()，获取 RPC 结果
+///
+/// ## 为什么需要这个 Awaiter？
+///
+/// 相比 CallAsync() 返回 std::future，CallCo() 返回 Task<RpcCallResult>，
+/// 允许调用方用协程语法顺序编写异步代码：
+///
+/// ```cpp
+/// // 使用 CallAsync（回调风格）
+/// auto future = client.CallAsync("Service", "Method", request);
+/// auto result = future.get();  // 阻塞等待
+///
+/// // 使用 CallCo（协程风格）
+/// rpc::coroutine::Task<RpcCallResult> CoroCall() {
+///   auto result = co_await client.CallCo("Service", "Method", request);
+///   // 结果就绪，继续处理
+///   co_return result;
+/// }
+/// ```
+///
+/// ## 关键设计：快路径优化
+///
+/// await_suspend() 返回 bool：
+/// - 返回 true：挂起协程，等待响应到达后恢复
+/// - 返回 false：不挂起协程，立即执行 await_resume()
+///
+/// 当响应已经先到达（BindCoroutine 返回 kAlreadyDone）时，
+/// await_suspend() 返回 false，避免不必要的挂起/恢复开销。
+class DirectCallCoAwaiter {
+ public:
+  /// @brief 构造函数
+  /// @param pending_calls 请求管理器的共享指针
+  /// @param request_id 本次请求的唯一标识符
+  /// @param deadline 请求的超时时间点
+  DirectCallCoAwaiter(std::shared_ptr<PendingCalls> pending_calls,
+                      std::string request_id,
+                      std::chrono::steady_clock::time_point deadline)
+      : pending_calls_(std::move(pending_calls)),
+        request_id_(std::move(request_id)),
+        deadline_(deadline) {}
+
+  /// @brief 检查是否需要挂起
+  /// @return 始终返回 false，让 await_suspend 决定是否挂起
+  ///
+  /// @note 这里始终返回 false 是一种优化策略：
+  ///       让 await_suspend 统一处理"需要挂起"和"已就绪"两种情况。
+  ///       因为 BindCoroutine 已经有快路径逻辑，没必要在这里预检查。
+  bool await_ready() const noexcept { return false; }
+
+  /// @brief 挂起协程并注册等待
+  /// @param handle 当前协程的句柄，用于后续恢复
+  /// @return true 表示需要挂起，false 表示立即恢复
+  ///
+  /// ## 返回值含义
+  ///
+  /// | BindCoroutineStatus | 返回值 | 含义 |
+  /// |---------------------|--------|------|
+  /// | kBound              | true   | 注册成功，等待响应后恢复 |
+  /// | kAlreadyDone        | false  | 响应已到，无需挂起（快路径）|
+  /// | kNotFound           | false  | 请求不存在，返回错误 |
+  /// | kAlreadyBound       | false  | 重复绑定，返回错误 |
+  ///
+  /// ## 快路径场景
+  ///
+  /// 当网络极快时，可能发生：协程刚执行到 await_suspend，响应已经到达。
+  /// 此时 BindCoroutine 返回 kAlreadyDone，await_suspend 返回 false，
+  /// 协程不会被挂起，直接进入 await_resume 获取结果。
+  bool await_suspend(std::coroutine_handle<> handle) {
+    // 将协程句柄注册到 PendingCalls，等待 Dispatcher 唤醒
+    const auto bind_status =
+        pending_calls_->BindCoroutine(request_id_, handle, deadline_);
+
+    switch (bind_status) {
+      case PendingCalls::BindCoroutineStatus::kBound:
+        // 注册成功，返回 true 让协程挂起
+        // 等 Dispatcher 收到响应后调用 resume() 恢复
+        return true;
+
+      case PendingCalls::BindCoroutineStatus::kAlreadyDone:
+        // 快路径：响应已先到达，无需挂起
+        // await_resume 会通过 TryPop 获取结果
+        return false;
+
+      case PendingCalls::BindCoroutineStatus::kNotFound:
+        // 异常情况：请求槽位不存在（可能被其他线程清理）
+        fallback_result_ = RpcCallResult{
+            {common::make_error_code(common::ErrorCode::kInternalError),
+             "bind coroutine waiter failed: request not found"},
+            {}};
+        return false;
+
+      case PendingCalls::BindCoroutineStatus::kAlreadyBound:
+        // 异常情况：槽位已被绑定（不应该发生，防御性编程）
+        fallback_result_ = RpcCallResult{
+            {common::make_error_code(common::ErrorCode::kInternalError),
+             "bind coroutine waiter failed: already bound"},
+            {}};
+        return false;
+    }
+
+    // 兜底：未知状态
+    fallback_result_ = RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "bind coroutine waiter failed: unexpected status"},
+        {}};
+    return false;
+  }
+
+  /// @brief 协程恢复时获取结果
+  /// @return RPC 调用结果
+  ///
+  /// ## 调用时机
+  ///
+  /// 1. 正常路径：Dispatcher 收到响应 → Complete() → resume() → await_resume()
+  /// 2. 快路径：await_suspend 返回 false → 立即执行 await_resume
+  /// 3. 错误路径：await_suspend 设置了 fallback_result_ → 返回错误
+  ///
+  /// ## 结果获取方式
+  ///
+  /// - 有 fallback_result_：await_suspend 中发生了错误，返回该错误
+  /// - TryPop 成功：响应已就绪，返回结果
+  /// - TryPop 失败：异常情况（协程被错误地恢复），返回错误
+  RpcCallResult await_resume() {
+    // 优先检查 fallback_result_（错误路径）
+    if (fallback_result_.has_value()) {
+      return std::move(*fallback_result_);
+    }
+
+    // 正常路径：从 PendingCalls 取出结果
+    // Complete() 已预先设置了 done=true 和 result
+    if (auto popped = pending_calls_->TryPop(request_id_); popped.has_value()) {
+      return std::move(*popped);
+    }
+
+    // 异常情况：协程被恢复但结果不存在
+    // 可能原因：超时后被 FailTimedOut 清理，然后又被 resume
+    return RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "coroutine waiter resumed without result"},
+        {}};
+  }
+
+ private:
+  std::shared_ptr<PendingCalls> pending_calls_;     ///< 请求管理器
+  std::string request_id_;                          ///< 请求 ID
+  std::chrono::steady_clock::time_point deadline_;  ///< 超时时间点
+  std::optional<RpcCallResult> fallback_result_;    ///< 错误情况下的兜底结果
+};
+
 }  // namespace
 
 RpcClient::RpcClient(std::string host, std::uint16_t port,
@@ -141,14 +304,12 @@ bool RpcClient::Connect() {
   addr.sin_port = htons(port_);
   if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) <= 0) {
     common::LogError("invalid server address: " + host_);
-    Close();
     return false;
   }
 
   if (::connect(conn_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
                 sizeof(addr)) < 0) {
     common::LogError(std::string("connect failed: ") + std::strerror(errno));
-    Close();
     return false;
   }
 
@@ -280,8 +441,49 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
 rpc::coroutine::Task<RpcCallResult> RpcClient::CallCo(
     std::string_view service_name, std::string_view method_name,
     std::string_view request_payload) {
-  co_return co_await rpc::coroutine::FromFuture(
-      CallAsync(service_name, method_name, request_payload));
+  if (!Connect()) {
+    co_return RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "connect failed"},
+        {}};
+  }
+
+  const std::string request_id = NextRequestId();
+  if (!pending_calls_->Add(request_id)) {
+    co_return RpcCallResult{
+        {common::make_error_code(common::ErrorCode::kInternalError),
+         "duplicate request_id in pending table"},
+        {}};
+  }
+
+  rpc::RpcRequest request;
+  request.set_request_id(request_id);
+  request.set_service_name(std::string(service_name));
+  request.set_method_name(std::string(method_name));
+  request.set_payload(std::string(request_payload));
+
+  std::string write_error;
+  {
+    std::scoped_lock write_lock(write_mu_);
+    if (!sock_ ||
+        !protocol::Codec::WriteMessage(sock_.Get(), request, &write_error)) {
+      auto result = RpcCallResult{
+          {common::make_error_code(common::ErrorCode::kInternalError),
+           "send request failed: " + (write_error.empty()
+                                          ? std::string("connection closed")
+                                          : write_error)},
+          {}};
+      (void)pending_calls_->Complete(request_id, result);
+      auto popped = pending_calls_->TryPop(request_id);
+      Close();
+      co_return popped.value_or(result);
+    }
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + options_.recv_timeout;
+
+  co_return co_await DirectCallCoAwaiter{pending_calls_, request_id, deadline};
 }
 
 /// RPC 响应分发循环

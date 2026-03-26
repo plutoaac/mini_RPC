@@ -93,7 +93,8 @@ class RpcClient {
 
   /// 通用协程 RPC 调用接口
   ///
-  /// 在现有 CallAsync 之上提供最小 co_await 友好包装层。
+  /// 直接将 coroutine waiter 绑定到 pending slot，由 dispatcher
+  /// 按 request_id 完成并恢复协程。
   [[nodiscard]] rpc::coroutine::Task<RpcCallResult> CallCo(
       std::string_view service_name, std::string_view method_name,
       std::string_view request_payload);

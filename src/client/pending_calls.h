@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <coroutine>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -40,6 +41,13 @@ namespace rpc::client {
 /// @endcode
 class PendingCalls {
  public:
+  enum class BindCoroutineStatus {
+    kBound,
+    kAlreadyDone,
+    kNotFound,
+    kAlreadyBound,
+  };
+
   /// 添加一个新的请求槽位
   ///
   /// 创建一个未完成状态的 Slot 用于后续接收响应。
@@ -56,6 +64,16 @@ class PendingCalls {
   [[nodiscard]] bool BindAsync(std::string_view request_id,
                                std::promise<RpcCallResult> promise,
                                std::chrono::steady_clock::time_point deadline);
+
+  /// 绑定协程等待者
+  ///
+  /// 为已存在请求槽位绑定协程句柄与 deadline。
+  /// - kBound: 绑定成功，调用方应挂起协程
+  /// - kAlreadyDone: 结果已就绪，调用方不应挂起
+  /// - kNotFound/kAlreadyBound: 绑定失败
+  [[nodiscard]] BindCoroutineStatus BindCoroutine(
+      std::string_view request_id, std::coroutine_handle<> handle,
+      std::chrono::steady_clock::time_point deadline);
 
   /// 完成一个请求并设置结果
   ///
@@ -133,6 +151,10 @@ class PendingCalls {
     std::optional<std::promise<RpcCallResult>> async_promise;
     /// 是否已绑定异步等待者
     bool async_bound{false};
+    /// 协程等待者句柄
+    std::coroutine_handle<> coroutine_handle{};
+    /// 是否已绑定协程等待者
+    bool coroutine_bound{false};
     /// 异步请求的 deadline（仅 async_bound=true 时有效）
     std::chrono::steady_clock::time_point deadline{};
   };

@@ -49,3 +49,57 @@ int main() {
   rpc::coroutine::SyncWait(RunDemo(client, request_payload));
   return 0;
 }
+/*
+
+
+RunDemo 协程
+    │
+    │  co_await client.CallCo(...)
+    │
+    ▼
+Task<RpcCallResult> task = CallCo(...)
+    │
+    │  task.operator co_await()  ← Task::Awaiter 被使用！
+    │
+    ▼
+Task::Awaiter
+    │
+    ├── await_ready() → false（Task 未完成）
+    │
+    ├── await_suspend(RunDemo的句柄)
+    │   │
+    │   │  保存 continuation = RunDemo的句柄
+    │   │
+    │   ▼
+    │  CallCo 协程内部：
+    │      co_await FromFuture(CallAsync(...))
+    │      │
+    │      ▼
+    │  FutureAwaiter
+    │      │
+    │      ├── await_ready() → false
+    │      ├── await_suspend() → 启动后台线程等待 future
+    │      │
+    │      ▼
+    │  后台线程：future.get() 完成
+    │      │
+    │      ▼
+    │  handle.resume() → 恢复 CallCo
+    │      │
+    │      ▼
+    │  CallCo: co_return 结果
+    │      │
+    │      ▼
+    │  final_suspend() → continuation.resume()
+    │      │
+    │      └──────────────────────────────┐
+    │                                    │
+    ▼                                    ▼
+RunDemo 协程恢复                      恢复 RunDemo
+    │
+    ▼
+awaiter.await_resume() → 获取 RpcCallResult
+
+
+
+*/
