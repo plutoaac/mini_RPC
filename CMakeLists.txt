@@ -15,6 +15,7 @@ message(STATUS "Using Protobuf ${Protobuf_VERSION}")
 set(PROTO_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/proto/rpc.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/proto/calc.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/user.proto
 )
 
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
@@ -23,6 +24,7 @@ add_library(rpc_framework
     ${PROTO_SRCS}
     src/protocol/codec.cpp
     src/server/service_registry.cpp
+    src/server/connection.cpp
     src/server/rpc_server.cpp
     src/client/event_loop.cpp
     src/client/pending_calls.cpp
@@ -236,6 +238,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME call_co_edge_cases_test COMMAND call_co_edge_cases_test)
+
+    add_executable(server_connection_test
+        tests/server_connection_test.cpp
+    )
+
+    target_link_libraries(server_connection_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME server_connection_test COMMAND server_connection_test)
 endif()
 
 add_executable(rpc_benchmark

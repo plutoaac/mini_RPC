@@ -68,8 +68,15 @@
 
 - `src/server/rpc_server.*`
   - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
-  - 解码请求、查找 handler、执行并返回响应
-  - 异常与错误统一映射到 `RpcResponse`
+  - accept 主循环创建 `Connection` 对象并驱动连接生命周期
+  - 保持阻塞 accept 模型，避免一步到位引入复杂 reactor
+
+- `src/server/connection.*`
+  - 连接级状态对象：`fd + read_buffer + write_buffer`
+  - 从 socket 读入字节流并在 `read_buffer` 上做长度前缀拆帧
+  - 支持半包保留与多包批量解析（一次读取可处理多条请求）
+  - 通过 `ServiceRegistry` 执行业务 handler，统一映射错误到 `RpcResponse`
+  - 将响应帧写入 `write_buffer` 并集中 flush 到 socket
 
 - `src/client/rpc_client.*`
   - 连接服务端
@@ -270,7 +277,7 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 ## 11. 测试
 
-本项目已提供 13 类可重复执行测试：
+本项目已提供 15 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -331,6 +338,14 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - 服务端乱序返回响应，验证两种 waiter 均按 request_id 正确匹配
   - 验证两条路径互不污染
 
+- `server_connection_test`：服务端 Connection + buffer 行为
+  - 单请求正常处理
+  - 半包输入可正确拼帧并处理
+  - 一次输入多 frame 可全部解析并返回
+  - 方法不存在返回 `METHOD_NOT_FOUND`
+  - handler 抛异常返回 `INTERNAL_ERROR`
+  - 非法请求 protobuf 返回 `PARSE_ERROR`
+
 运行方式：
 
 ```bash
@@ -375,7 +390,9 @@ cd rpc_project/build
 当前代码保持阻塞式最小闭环，但接口设计已为后续扩展预留：
 - `Codec` 可替换为异步读写实现（epoll/io_uring）
 - 客户端已具备轻量 reactor 骨架，可演进为 coroutine 驱动 I/O
-- `RpcServer` 的连接处理可演进为协程调度
+- 服务端已从过程式 `HandleClient` 循环演进到 `Connection + buffer` 模型
+- 当前服务端仍不是完整生产级 reactor，但连接层次已可平滑接入 epoll
+- `RpcServer` 的连接驱动可继续演进到事件驱动或协程调度
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
 
 coroutine API 的后续演进方向：
