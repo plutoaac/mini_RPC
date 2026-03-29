@@ -6,7 +6,14 @@
 - C++20 coroutine 版本
 - io_uring 异步 IO 版本
 
-本阶段已从纯阻塞式客户端分发循环，演进到轻量 event loop / reactor 雏形。
+本阶段已从纯阻塞式连接处理，演进到轻量 event loop / reactor 雏形。
+
+服务端当前定位：
+- 已从“accept 一个连接后阻塞处理到断开”演进为“单线程 epoll + 多 Connection 驱动”
+- `Connection` 负责连接级协议解析、读写缓冲与响应排队
+- `RpcServer` 负责 listen/accept、epoll 事件循环与连接生命周期管理
+- 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
+- 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
 当前版本已将 coroutine API 从“future bridge”升级为“direct waiter”模式：
 - `PendingCalls` 支持 coroutine waiter（协程句柄 + deadline）
@@ -19,7 +26,7 @@
 框架能力（当前版本）：
 - 通用 RPC 请求/响应消息（`RpcRequest` / `RpcResponse`）
 - 自定义协议：`[4字节长度][protobuf数据]`
-- 阻塞式 TCP 通信
+- 服务端单线程 epoll 事件循环（listen fd + 多连接 fd）
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
 - 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
@@ -68,15 +75,17 @@
 
 - `src/server/rpc_server.*`
   - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
-  - accept 主循环创建 `Connection` 对象并驱动连接生命周期
-  - 保持阻塞 accept 模型，避免一步到位引入复杂 reactor
+  - 单线程 epoll 事件循环，统一管理 listen fd 与多个 client fd
+  - accept 新连接后创建 `Connection` 对象并注册到 epoll
+  - 根据可读/可写事件驱动连接生命周期与缓冲区刷新
 
 - `src/server/connection.*`
   - 连接级状态对象：`fd + read_buffer + write_buffer`
+  - 适配非阻塞 socket，处理 `EINTR` / `EAGAIN` / `EWOULDBLOCK`
   - 从 socket 读入字节流并在 `read_buffer` 上做长度前缀拆帧
   - 支持半包保留与多包批量解析（一次读取可处理多条请求）
   - 通过 `ServiceRegistry` 执行业务 handler，统一映射错误到 `RpcResponse`
-  - 将响应帧写入 `write_buffer` 并集中 flush 到 socket
+  - 将响应帧写入 `write_buffer` 并在可写事件中 flush 到 socket
 
 - `src/client/rpc_client.*`
   - 连接服务端
@@ -277,7 +286,7 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 ## 11. 测试
 
-本项目已提供 15 类可重复执行测试：
+本项目已提供 16 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -345,6 +354,10 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - 方法不存在返回 `METHOD_NOT_FOUND`
   - handler 抛异常返回 `INTERNAL_ERROR`
   - 非法请求 protobuf 返回 `PARSE_ERROR`
+
+- `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
+  - 多个 client 连接同时存在
+  - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
 
 运行方式：
 

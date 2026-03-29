@@ -1,56 +1,70 @@
 /**
  * @file rpc_server.h
- * @brief RPC 服务器核心模块
- *
- * 本文件定义了 RpcServer 类，实现了阻塞式的 RPC 服务器。
- * RpcServer 负责：
- * - 监听指定端口的 TCP 连接
- * - 接受客户端连接
- * - 为每个连接创建 Connection 对象进行处理
- *
- * ## 架构设计
- *
+ * @brief RPC 服务端核心模块
+ * 
+ * 本文件定义了 RpcServer 类，是 RPC 框架服务端的核心组件。
+ * RpcServer 负责监听客户端连接、管理事件循环，并将请求分发给对应的 Connection 处理。
+ * 
+ * ## 架构概述
+ * 
  * ```
- *                    +------------------+
- *                    |   RpcServer      |
- *                    |------------------|
- *    Client -------->|  accept() loop   |
- *                    |        |         |
- *                    |        v         |
- *                    |  Connection      |
- *                    |  (per client)    |
- *                    +------------------+
+ *                    +------------------------+
+ *                    |       RpcServer        |
+ *                    |------------------------|
+ *                    |  listen_fd_ (socket)   |
+ *                    |  epoll_fd_ (事件循环)   |
+ *                    |  connections_ (连接表)  |
+ *                    +------------------------+
+ *                              |
+ *          +-------------------+-------------------+
+ *          |                   |                   |
+ *    +------------+      +------------+      +------------+
+ *    | Connection |      | Connection |      | Connection |
+ *    |  (fd=5)    |      |  (fd=6)    |      |  (fd=7)    |
+ *    +------------+      +------------+      +------------+
  * ```
- *
- * ## 特点
- *
- * - **阻塞式设计**：采用同步阻塞 I/O 模型，简单可靠
- * - **串行处理**：一次只处理一个客户端连接
- * - **RAII 资源管理**：通过 UniqueFd 自动管理 socket 生命周期
- *
- * ## 适用场景
- *
- * - 连接数较少的内部服务
- * - 对延迟不敏感的后台任务
- * - 开发测试环境
- *
+ * 
+ * ## 工作流程
+ * 
+ * 1. **初始化阶段**
+ *    - 创建监听 socket
+ *    - 设置 SO_REUSEADDR 选项
+ *    - 绑定端口并开始监听
+ *    - 创建 epoll 实例
+ * 
+ * 2. **事件循环阶段**
+ *    - 等待 epoll 事件
+ *    - 处理新连接（listen fd 可读）
+ *    - 处理现有连接的读写事件
+ * 
+ * 3. **连接管理**
+ *    - 新连接到来时创建 Connection 对象
+ *    - 连接错误或关闭时清理资源
+ * 
  * ## 使用示例
- *
+ * 
  * @code
  *   // 创建服务注册表并注册方法
  *   ServiceRegistry registry;
- *   registry.Register("Calculator", "Add", [](std::string_view req) {
- *     // 处理请求...
- *     return response;
- *   });
- *
+ *   registry.Register("Calculator", "Add", AddHandler);
+ *   
  *   // 创建并启动服务器
  *   RpcServer server(8080, registry);
- *   server.Start();  // 阻塞运行
+ *   if (!server.Start()) {
+ *     std::cerr << "Server start failed\n";
+ *     return 1;
+ *   }
  * @endcode
- *
- * @see Connection 客户端连接处理
- * @see ServiceRegistry 服务方法注册
+ * 
+ * ## 设计特点
+ * 
+ * - **单线程模型**：使用 epoll 实现高效的单线程事件驱动
+ * - **非阻塞 I/O**：所有 socket 均为非阻塞模式
+ * - **RAII 资源管理**：使用 UniqueFd 自动管理文件描述符
+ * - **优雅关闭**：连接关闭时自动清理 epoll 注册
+ * 
+ * @see Connection 处理单个客户端连接
+ * @see ServiceRegistry 服务方法注册表
  * @author RPC Framework Team
  * @date 2024
  */
@@ -59,87 +73,118 @@
 
 #include <cstdint>  // std::uint16_t
 
-#include "common/unique_fd.h"         // RAII 文件描述符包装
+#include "common/unique_fd.h"    // RAII 文件描述符封装
 #include "server/service_registry.h"  // 服务注册表
 
 namespace rpc::server {
 
 /**
  * @class RpcServer
- * @brief 阻塞式 RPC 服务器
- *
- * RpcServer 是一个简单的阻塞式 RPC 服务器实现。
- * 它监听指定端口，接受客户端连接，并为每个连接创建
- * Connection 对象进行处理。
- *
- * ## 服务器生命周期
- *
- * 1. **创建**：指定监听端口和服务注册表
- * 2. **启动**：调用 Start() 开始监听和接受连接
- * 3. **运行**：持续处理连接直到进程终止
- *
- * ## 连接处理模型
- *
- * ```
- * while (true) {
- *   client_fd = accept(listen_fd);
- *   Connection conn(client_fd, registry);
- *   conn.Serve();  // 阻塞处理直到连接关闭
- * }
- * ```
- *
- * ## 限制
- *
- * - 一次只能处理一个客户端连接
- * - 不支持并发请求
- * - 不支持优雅关闭
- *
- * @note 此服务器设计用于简单场景，生产环境建议使用更高级的服务器
+ * @brief 单线程 epoll RPC 服务端
+ * 
+ * RpcServer 是 RPC 框架的核心服务端类，负责：
+ * - 监听指定端口的客户端连接
+ * - 管理 epoll 事件循环
+ * - 分发请求到对应的 Connection 处理
+ * 
+ * ## 核心职责
+ * 
+ * 1. **连接接入**
+ *    - 监听 socket 上的新连接请求
+ *    - 使用 accept4 创建非阻塞客户端 socket
+ *    - 将新连接注册到 epoll
+ * 
+ * 2. **事件分发**
+ *    - 监听 EPOLLIN、EPOLLOUT、EPOLLRDHUP 等事件
+ *    - 根据事件类型调用 Connection 的相应方法
+ *    - 动态调整 epoll 事件注册
+ * 
+ * 3. **生命周期管理**
+ *    - 维护所有活跃连接的映射表
+ *    - 连接关闭时清理资源
+ * 
+ * ## 线程模型
+ * 
+ * RpcServer 采用单线程事件驱动模型：
+ * - 所有 I/O 操作在主线程完成
+ * - 使用非阻塞 socket 避免阻塞
+ * - epoll 实现高效的多路复用
+ * 
+ * @note 服务端目前不支持优雅关闭，调用 Start() 后将无限循环
  */
 class RpcServer {
  public:
   /**
-   * @brief 构造函数
-   *
-   * 初始化 RPC 服务器配置。
-   *
-   * @param port 监听端口号（1-65535）
-   * @param registry 服务注册表的引用，用于处理 RPC 请求
-   *
+   * @brief 构造 RpcServer 实例
+   * 
+   * @param port 监听端口号（主机字节序）
+   * @param registry 服务注册表的常量引用
+   * 
    * @note registry 必须在 RpcServer 整个生命周期内保持有效
-   * @note 构造函数不会绑定端口，实际监听在 Start() 中进行
-   *
+   * @note 构造函数不会创建 socket 或绑定端口，实际初始化在 Start() 中进行
+   * 
+   * ## 示例
+   * 
    * @code
    *   ServiceRegistry registry;
-   *   RpcServer server(8080, registry);
+   *   // ... 注册服务方法 ...
+   *   
+   *   RpcServer server(8080, registry);  // 在 8080 端口监听
    * @endcode
    */
   RpcServer(std::uint16_t port, const ServiceRegistry& registry);
 
   /**
-   * @brief 启动服务器
-   *
-   * 执行以下操作：
+   * @brief 启动服务端事件循环
+   * 
+   * 执行完整的初始化流程并进入无限事件循环。
+   * 
+   * ## 初始化流程
+   * 
    * 1. 创建 TCP socket
    * 2. 设置 SO_REUSEADDR 选项
-   * 3. 绑定到指定端口
-   * 4. 开始监听
-   * 5. 进入 accept 循环
-   *
-   * @return true 服务器正常启动（通常不会返回，除非启动失败）
-   * @return false 服务器启动失败（如端口被占用）
-   *
-   * @note 此方法是阻塞的，会无限循环接受连接
-   * @note 启动失败时会记录错误日志
-   * @note 每个连接处理完成后才会接受下一个连接
-   *
+   * 3. 设置非阻塞模式
+   * 4. 绑定端口
+   * 5. 开始监听（backlog=128）
+   * 6. 创建 epoll 实例
+   * 7. 注册监听 socket 到 epoll
+   * 
+   * ## 事件循环
+   * 
+   * 进入无限循环处理事件：
+   * - 新连接：accept4 创建客户端 socket，注册到 epoll
+   * - 读事件：调用 Connection::OnReadable()
+   * - 写事件：调用 Connection::OnWritable()
+   * - 错误/关闭：清理连接资源
+   * 
+   * @return true 不应该到达（无限循环）
+   * @return false 初始化失败或运行时致命错误
+   * 
    * ## 错误处理
-   *
-   * - socket 创建失败：返回 false
-   * - setsockopt 失败：返回 false
-   * - bind 失败：返回 false（可能是端口被占用）
-   * - listen 失败：返回 false
-   * - accept 失败：记录日志并继续等待新连接
+   * 
+   * 以下情况会返回 false：
+   * - socket() 创建失败
+   * - setsockopt() 设置失败
+   * - fcntl() 设置非阻塞失败
+   * - bind() 绑定失败（端口被占用）
+   * - listen() 监听失败
+   * - epoll_create1() 创建失败
+   * - epoll_ctl() 注册失败
+   * - epoll_wait() 返回错误（非 EINTR）
+   * 
+   * @note 此方法会阻塞当前线程，直到发生致命错误
+   * @note 目前没有提供优雅关闭的机制
+   * 
+   * ## 示例
+   * 
+   * @code
+   *   RpcServer server(8080, registry);
+   *   if (!server.Start()) {
+   *     std::cerr << "Server failed to start\n";
+   *     return 1;
+   *   }
+   *   // 不会到达这里
+   * @endcode
    */
   bool Start();
 
@@ -149,17 +194,18 @@ class RpcServer {
 
   /**
    * @brief 监听端口号
-   *
-   * 服务器绑定的 TCP 端口号。
-   * 范围：1-65535（实际使用时应避免系统保留端口）
+   * 
+   * 服务端绑定的 TCP 端口号，主机字节序。
+   * 有效范围：1-65535，建议使用 1024 以上的端口。
    */
   std::uint16_t port_;
 
   /**
    * @brief 服务注册表引用
-   *
-   * 用于查找和调用 RPC 方法。
-   * 生命周期由外部管理，必须在 RpcServer 整个生命周期内保持有效。
+   * 
+   * 持有 ServiceRegistry 的常量引用，用于查找请求对应的处理函数。
+   * 
+   * @warning 调用者必须确保 registry 在 RpcServer 整个生命周期内有效
    */
   const ServiceRegistry& registry_;
 };

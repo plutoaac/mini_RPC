@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -81,6 +83,9 @@ int main() {
     throw std::runtime_error("boom");
     return std::string{};
   }));
+  assert(registry.Register(
+      "EchoService", "Large",
+      [](std::string_view request) { return std::string(request); }));
 
   int fds[2] = {-1, -1};
   assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -203,6 +208,80 @@ int main() {
   client_fd.Reset();
 
   server_thread.join();
+
+  // 6) 非阻塞写回下的部分写/回压场景：响应不丢失。
+  {
+    int pair_fds[2] = {-1, -1};
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair_fds) == 0);
+
+    rpc::common::UniqueFd nb_server_fd(pair_fds[0]);
+    rpc::common::UniqueFd nb_client_fd(pair_fds[1]);
+
+    const int flags = ::fcntl(nb_server_fd.Get(), F_GETFL, 0);
+    assert(flags >= 0);
+    assert(::fcntl(nb_server_fd.Get(), F_SETFL, flags | O_NONBLOCK) == 0);
+
+    int client_send_buf = 2 * 1024 * 1024;
+    assert(::setsockopt(nb_client_fd.Get(), SOL_SOCKET, SO_SNDBUF,
+                        &client_send_buf, sizeof(client_send_buf)) == 0);
+
+    int send_buf = 1024;
+    assert(::setsockopt(nb_server_fd.Get(), SOL_SOCKET, SO_SNDBUF, &send_buf,
+                        sizeof(send_buf)) == 0);
+
+    rpc::server::Connection nb_connection(std::move(nb_server_fd), registry);
+
+    rpc::RpcRequest req = MakeRequest("req-7", "EchoService", "Large",
+                                      std::string(512 * 1024, 'x'));
+    std::string frame;
+    assert(BuildFrame(req, &frame));
+
+    auto sender = std::async(std::launch::async, [&]() {
+      assert(SendAll(nb_client_fd.Get(), frame.data(), frame.size()));
+    });
+
+    std::string error;
+    for (int i = 0; i < 1024 && !nb_connection.HasPendingWrite(); ++i) {
+      assert(nb_connection.OnReadable(&error));
+      if (!nb_connection.HasPendingWrite()) {
+        std::this_thread::yield();
+      }
+    }
+    assert(nb_connection.HasPendingWrite());
+    sender.get();
+
+    bool saw_backpressure = false;
+    for (int i = 0; i < 32 && nb_connection.HasPendingWrite(); ++i) {
+      assert(nb_connection.OnWritable(&error));
+      if (nb_connection.HasPendingWrite()) {
+        saw_backpressure = true;
+      }
+    }
+    assert(saw_backpressure);
+
+    auto reader = std::async(std::launch::async, [&]() {
+      rpc::RpcResponse resp;
+      std::string read_error;
+      const bool ok = rpc::protocol::Codec::ReadMessage(nb_client_fd.Get(),
+                                                        &resp, &read_error);
+      assert(ok);
+      assert(resp.request_id() == "req-7");
+      assert(resp.error_code() == rpc::OK);
+      assert(resp.payload().size() == 512 * 1024);
+      assert(resp.payload()[0] == 'x');
+      assert(resp.payload().back() == 'x');
+    });
+
+    for (int i = 0; i < 1024 && nb_connection.HasPendingWrite(); ++i) {
+      assert(nb_connection.OnWritable(&error));
+      if (nb_connection.ShouldClose()) {
+        break;
+      }
+    }
+
+    assert(!nb_connection.HasPendingWrite());
+    reader.get();
+  }
 
   std::cout << "server_connection_test passed\n";
   return 0;
