@@ -62,9 +62,10 @@ class Task {
     std::shared_future<T>
         completion_future;                 ///< 用于获取协程结果（可多次获取）
     std::coroutine_handle<> continuation;  ///< 调用者协程句柄（用于恢复调用者）
-    std::optional<T> result_value;         ///< 暂存 co_return 值，final_suspend 再发布
-    std::exception_ptr unhandled_error;    ///< 暂存未捕获异常，final_suspend 再发布
-    bool completion_set{false};            ///< 防止重复 set_value/set_exception
+    std::optional<T> result_value;  ///< 暂存 co_return 值，final_suspend 再发布
+    std::exception_ptr
+        unhandled_error;         ///< 暂存未捕获异常，final_suspend 再发布
+    bool completion_set{false};  ///< 防止重复 set_value/set_exception
 
     /// @brief 构造函数，初始化 shared_future
     promise_type()
@@ -121,16 +122,12 @@ class Task {
     ///
     /// 当协程执行 co_return value 时，编译器调用此方法。
     /// 将值设置到 promise 中，使得等待者可以通过 future 获取结果。
-    void return_value(T value) {
-      result_value = std::move(value);
-    }
+    void return_value(T value) { result_value = std::move(value); }
 
     /// @brief 处理协程中的未捕获异常
     ///
     /// 异常会被存储到 promise 中，等待者获取结果时会重新抛出。
-    void unhandled_exception() {
-      unhandled_error = std::current_exception();
-    }
+    void unhandled_exception() { unhandled_error = std::current_exception(); }
 
     void PublishCompletion() noexcept {
       if (completion_set) {
@@ -231,6 +228,14 @@ class Task {
   /// 通常用于在非协程上下文中获取协程结果。
   T Get() { return handle_.promise().completion_future.get(); }
 
+  [[nodiscard]] bool IsReady() const {
+    if (!handle_) {
+      return true;
+    }
+    return handle_.promise().completion_future.wait_for(
+               std::chrono::seconds(0)) == std::future_status::ready;
+  }
+
  private:
   /// @brief 重置 Task，销毁关联的协程
   ///
@@ -307,9 +312,7 @@ class Task<void> {
     /// @brief 处理 co_return; 或协程体执行完毕
     void return_void() {}
 
-    void unhandled_exception() {
-      unhandled_error = std::current_exception();
-    }
+    void unhandled_exception() { unhandled_error = std::current_exception(); }
 
     void PublishCompletion() noexcept {
       if (completion_set) {
@@ -376,6 +379,14 @@ class Task<void> {
 
   /// @brief 同步等待 void Task 完成
   void Get() { handle_.promise().completion_future.get(); }
+
+  [[nodiscard]] bool IsReady() const {
+    if (!handle_) {
+      return true;
+    }
+    return handle_.promise().completion_future.wait_for(
+               std::chrono::seconds(0)) == std::future_status::ready;
+  }
 
  private:
   /// @brief 重置 Task，销毁关联的协程

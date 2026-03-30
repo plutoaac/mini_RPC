@@ -12,6 +12,7 @@
 - 已从“accept 一个连接后阻塞处理到断开”演进为“单线程 epoll + 多 Connection 驱动”
 - `Connection` 负责连接级协议解析、读写缓冲与响应排队
 - `RpcServer` 负责 listen/accept、epoll 事件循环与连接生命周期管理
+- 已引入“连接级 coroutine 雏形”：epoll 继续负责 readiness，连接协程负责顺序化读写流程
 - 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
@@ -77,7 +78,8 @@
   - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
   - 单线程 epoll 事件循环，统一管理 listen fd 与多个 client fd
   - accept 新连接后创建 `Connection` 对象并注册到 epoll
-  - 根据可读/可写事件驱动连接生命周期与缓冲区刷新
+  - 根据可读/可写事件恢复对应连接协程的等待点
+  - 连接处理流程可按 `Task<void> HandleConnectionCo(Connection&)` 逐步演进
 
 - `src/server/connection.*`
   - 连接级状态对象：`fd + read_buffer + write_buffer`
@@ -86,6 +88,9 @@
   - 支持半包保留与多包批量解析（一次读取可处理多条请求）
   - 通过 `ServiceRegistry` 执行业务 handler，统一映射错误到 `RpcResponse`
   - 将响应帧写入 `write_buffer` 并在可写事件中 flush 到 socket
+  - 新增协程接口：`ReadRequestCo/WriteResponseCo`
+  - 新增协程等待点：`WaitReadableCo/WaitWritableCo`
+  - 新增 epoll 通知恢复入口：`NotifyReadable/NotifyWritable`
 
 - `src/client/rpc_client.*`
   - 连接服务端
@@ -286,7 +291,7 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 ## 11. 测试
 
-本项目已提供 16 类可重复执行测试：
+本项目已提供 17 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -355,6 +360,11 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - handler 抛异常返回 `INTERNAL_ERROR`
   - 非法请求 protobuf 返回 `PARSE_ERROR`
 
+- `server_connection_coroutine_test`：服务端连接协程雏形
+  - `ReadRequestCo/WriteResponseCo` 的读写成功路径
+  - 半包输入下协程可挂起并在下一次可读事件恢复
+  - 写阶段在可写事件到达后恢复并发送响应
+
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
   - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
@@ -407,6 +417,11 @@ cd rpc_project/build
 - 当前服务端仍不是完整生产级 reactor，但连接层次已可平滑接入 epoll
 - `RpcServer` 的连接驱动可继续演进到事件驱动或协程调度
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
+
+服务端 coroutine 方向说明：
+- 当前是连接级 coroutine 雏形，不是完整 coroutine runtime
+- 不引入多线程 reactor / io_uring，继续以单线程 epoll 作为 I/O readiness 基座
+- 后续可继续增加连接协程的 deadline、取消、背压策略与更细粒度状态机
 
 coroutine API 的后续演进方向：
 - 进一步减少 bridge 残余路径与对象复制开销

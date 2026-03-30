@@ -251,6 +251,18 @@ if(BUILD_TESTING)
 
     add_test(NAME server_connection_test COMMAND server_connection_test)
 
+    add_executable(server_connection_coroutine_test
+        tests/server_connection_coroutine_test.cpp
+    )
+
+    target_link_libraries(server_connection_coroutine_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME server_connection_coroutine_test COMMAND server_connection_coroutine_test)
+
     add_executable(server_multi_connection_test
         tests/server_multi_connection_test.cpp
     )

@@ -1,0 +1,554 @@
+================================================================================
+                    RPC 服务端协程流程图 - Connection Awaiter 机制
+================================================================================
+
+【概述】
+服务端通过 Connection 类的 Awaiter 实现，使得协程可以异步等待 I/O 事件。
+核心组件：ReadableAwaiter、WritableAwaiter、事件通知机制
+
+【重要：co_await 的两层嵌套调用】
+
+当调用 co_await connection->ReadRequestCo(coroutine_error) 时，会发生两层 co_await：
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    co_await ReadRequestCo() 的完整流程                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  HandleConnectionCo 协程中：                                                  │
+│      const bool read_ok = co_await connection->ReadRequestCo(error);         │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ 第一层：co_await Task<bool>                                              │ │
+│  │                                                                         │ │
+│  │ Task::Awaiter::await_ready()    → 检查 Task 是否已完成                  │ │
+│  │ Task::Awaiter::await_suspend()  → 注册 continuation，挂起调用者协程     │ │
+│  │ Task::Awaiter::await_resume()   → 获取 Task 返回值                      │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ ReadRequestCo 协程内部执行：                                             │ │
+│  │                                                                         │ │
+│  │     co_await WaitReadableCo();  ← 第二层 co_await                       │ │
+│  │             │                                                           │ │
+│  │             ▼                                                           │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ 第二层：co_await ReadableAwaiter                                     │ │ │
+│  │ │                                                                     │ │ │
+│  │ │ ReadableAwaiter::await_ready()   → 检查 read_ready_/should_close_  │ │ │
+│  │ │ ReadableAwaiter::await_suspend() → 保存句柄到 read_waiter_         │ │ │
+│  │ │ ReadableAwaiter::await_resume()  → 清除 read_ready_ 标志           │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────┘ │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+关键理解：
+- 外层 co_await (Task) 实现协程间等待，等待 ReadRequestCo 协程完成
+- 内层 co_await (ReadableAwaiter) 实现 I/O 等待，等待 socket 可读
+- ReadRequestCo 协程启动后立即执行，遇到内层 co_await 才会挂起
+- 当 I/O 就绪后，内层 co_await 完成，ReadRequestCo 继续执行 OnReadable()
+- ReadRequestCo 执行完毕后，外层 co_await 完成，返回结果给调用者
+
+                      co_await ReadRequestCo() 详细执行流程
+
+Step 1: HandleConnectionCo 协程调用 co_await ReadRequestCo()
+        │
+        │  【代码位置：rpc_server.cpp 第 45 行】
+        │
+        └─ const bool read_ok = co_await connection->ReadRequestCo(coroutine_error);
+              │
+              ├─ ReadRequestCo() 返回 Task<bool>
+              │
+              └─ 触发 Task::operator co_await()
+
+Step 2: 第一层 Awaiter - Task::Awaiter::await_ready()
+        │
+        │  【代码位置：task.h Task::Awaiter::await_ready()】
+        │
+        └─ 检查 Task 是否已完成
+              │
+              ├─ 已完成？ → 返回 true，直接执行 await_resume()
+              │
+              └─ 未完成？ → 返回 false，执行 await_suspend()
+
+Step 3: 第一层 Awaiter - Task::Awaiter::await_suspend()
+        │
+        │  【代码位置：task.h Task::Awaiter::await_suspend()】
+        │
+        ├─ 保存调用者协程句柄到 continuation
+        │     promise.continuation = awaiting;
+        │
+        └─ 返回 true → HandleConnectionCo 协程挂起
+              │
+              └─ 控制权转移，ReadRequestCo 协程开始执行
+
+Step 4: ReadRequestCo 协程开始执行
+        │
+        │  【代码位置：connection.cpp ReadRequestCo()】
+        │
+        └─ co_await WaitReadableCo();  ← 触发第二层 co_await
+              │
+              └─ 返回 ReadableAwaiter
+
+Step 5: 第二层 Awaiter - ReadableAwaiter::await_ready()
+        │
+        │  【代码位置：connection.cpp ReadableAwaiter::await_ready()】
+        │
+        └─ 检查 should_close_ 或 read_ready_
+              │
+              ├─ 条件满足？ → 返回 true，无需等待
+              │
+              └─ 条件不满足？ → 返回 false，需要挂起
+
+Step 6: 第二层 Awaiter - ReadableAwaiter::await_suspend()
+        │
+        │  【代码位置：connection.cpp ReadableAwaiter::await_suspend()】
+        │
+        ├─ 保存协程句柄到 read_waiter_
+        │     connection_->read_waiter_ = handle;
+        │
+        └─ 返回 true → ReadRequestCo 协程挂起
+
+        ... 此时两个协程都挂起，控制权返回事件循环 ...
+        ... epoll_wait() 等待 socket 可读事件 ...
+        ... 客户端发送数据 ...
+        ... epoll_wait() 返回 EPOLLIN 事件 ...
+        ... NotifyReadable() 被调用 ...
+
+Step 7: 事件循环调用 NotifyReadable()
+        │
+        │  【代码位置：rpc_server.cpp 第 211-213 行】
+        │
+        └─ state.connection.NotifyReadable();
+              │
+              ├─ read_ready_ = true
+              │
+              └─ ResumeWaiter(read_waiter_)
+                    │
+                    └─ handle.resume()  ← 恢复 ReadRequestCo 协程
+
+Step 8: 第二层 Awaiter - ReadableAwaiter::await_resume()
+        │
+        │  【代码位置：connection.cpp ReadableAwaiter::await_resume()】
+        │
+        └─ read_ready_ = false  ← 清除标志
+              │
+              └─ co_await WaitReadableCo() 完成
+
+Step 9: ReadRequestCo 协程继续执行
+        │
+        │  【代码位置：connection.cpp ReadRequestCo()】
+        │
+        ├─ 检查 ShouldClose()?
+        │
+        └─ 调用 OnReadable(error_msg)
+              │
+              ├─ ReadFromSocket() → recv()
+              ├─ TryParseRequests()
+              └─ QueueResponse()
+              │
+              └─ co_return OnReadable(error_msg)  ← ReadRequestCo 协程完成
+
+Step 10: Task 协程完成，触发 final_suspend
+         │
+         │  【代码位置：task.h FinalAwaiter::await_suspend()】
+         │
+         ├─ PublishCompletion() → 设置 promise 值
+         │
+         └─ 返回 continuation → 恢复 HandleConnectionCo 协程
+
+Step 11: 第一层 Awaiter - Task::Awaiter::await_resume()
+         │
+         │  【代码位置：task.h Task::Awaiter::await_resume()】
+         │
+         └─ return handle_.promise().completion_future.get();
+              │
+              └─ 返回 bool 结果给 HandleConnectionCo
+
+Step 12: HandleConnectionCo 协程继续执行
+         │
+         └─ const bool read_ok = <上一步返回的值>
+               │
+               └─ 继续执行后续代码...
+
+
+【重要：服务端 I/O 模型】
+服务端的 I/O 是"被动"的，不是主动发起请求！
+- 客户端主动发起连接和发送数据
+- 服务端被动等待数据到达（通过 epoll 监听）
+- 当 socket 可读时，epoll 返回，服务端才执行 recv() 读取数据
+
+================================================================================
+                      实际 I/O 操作发生的位置（关键！）
+================================================================================
+
+【读 I/O】Connection::ReadFromSocket() → recv() 系统调用
+    │
+    ├─ 代码位置：connection.cpp 第 583-627 行
+    │
+    ├─ 调用链：
+    │     ReadRequestCo() 恢复后
+    │       → OnReadable()
+    │         → ReadFromSocket()
+    │           → ::recv(fd_, chunk, 4096, 0)  ← 实际的读 I/O
+    │
+    └─ 时机：协程恢复后执行，此时数据已经在内核缓冲区中
+
+【写 I/O】Connection::FlushWrites() → send() 系统调用
+    │
+    ├─ 代码位置：connection.cpp 第 714-757 行
+    │
+    ├─ 调用链：
+    │     WriteResponseCo() 恢复后
+    │       → OnWritable()
+    │         → FlushWrites()
+    │           → ::send(fd_, buffer, size, MSG_NOSIGNAL)  ← 实际的写 I/O
+    │
+    └─ 时机：协程恢复后执行，此时 socket 发送缓冲区有空间
+
+【为什么协程先挂起，后执行 I/O？】
+    这是一个"等待就绪 → 执行 I/O"的模式：
+    
+    1. 协程调用 co_await WaitReadableCo() → 协程挂起
+    2. 事件循环继续运行，调用 epoll_wait() 等待事件
+    3. 客户端发送数据 → 数据到达内核 socket 缓冲区
+    4. epoll_wait() 返回 EPOLLIN 事件（socket 可读）
+    5. 事件循环调用 NotifyReadable() → 恢复协程
+    6. 协程调用 recv() 读取数据（此时数据已就绪，不会阻塞）
+    
+    对比客户端：
+    - 客户端主动发送请求 → 等待响应
+    - 服务端被动等待数据 → 数据到达后读取
+
+================================================================================
+                         完整流程：从事件循环到 I/O 执行
+================================================================================
+
+【RpcServer::Start() 事件循环 - rpc_server.cpp】
+
+                    ┌─────────────────────────────────────┐
+                    │         RpcServer::Start()          │
+                    │              主循环                  │
+                    └─────────────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────────────┐
+                    │   epoll_wait(epoll_fd, events, 64)  │
+                    │         等待事件发生                 │
+                    └─────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+                    ▼               ▼               ▼
+              EPOLLIN          EPOLLOUT       EPOLLHUP/ERR
+           (socket可读)     (socket可写)      (连接错误)
+                    │               │               │
+                    ▼               ▼               ▼
+          NotifyReadable()  NotifyWritable()  MarkClosing()
+                    │               │               │
+                    └───────────────┴───────────────┘
+                                    │
+                                    ▼
+                          ResumeWaiter()
+                          恢复挂起的协程
+                                    │
+                                    ▼
+                    ┌─────────────────────────────────────┐
+                    │        协程恢复执行                  │
+                    │                                     │
+                    │  ReadRequestCo() 恢复后：           │
+                    │    → OnReadable()                   │
+                    │      → ReadFromSocket() ──► recv() │
+                    │                                     │
+                    │  WriteResponseCo() 恢复后：         │
+                    │    → OnWritable()                   │
+                    │      → FlushWrites() ────► send()  │
+                    └─────────────────────────────────────┘
+
+================================================================================
+                              协程等待可读事件流程
+================================================================================
+
+Step 1: 服务协程调用 ReadRequestCo()
+        │
+        ├─ ReadRequestCo 协程开始执行
+        │     │
+        │     └─ co_await WaitReadableCo()  ← 创建 ReadableAwaiter
+        │
+        └─ ReadableAwaiter 开始执行
+
+Step 2: ReadableAwaiter::await_ready() 检查状态
+        │
+        ├─ should_close_ == true?
+        │     └─ 是 → 返回 true，无需等待，协程继续
+        │
+        ├─ read_ready_ == true?
+        │     └─ 是 → 返回 true，数据已就绪，协程继续
+        │
+        └─ 否 → 返回 false，需要挂起协程
+
+Step 3: ReadableAwaiter::await_suspend(handle) 挂起协程
+        │
+        ├─ 再次检查条件（防止竞态）
+        │     └─ 条件满足 → 返回 false，取消挂起
+        │
+        ├─ 保存协程句柄到 read_waiter_
+        │     connection_->read_waiter_ = handle
+        │
+        └─ 返回 true → 协程挂起，控制权返回事件循环
+
+        ... 协程挂起中，事件循环继续运行 ...
+        ... epoll_wait() 等待 socket 可读事件 ...
+        ... 客户端发送数据，数据到达内核缓冲区 ...
+        ... epoll_wait() 返回 EPOLLIN 事件 ...
+
+Step 4: 事件循环检测到 socket 可读 (EPOLLIN)
+        │
+        │  【代码位置：rpc_server.cpp 第 211-213 行】
+        │
+        └─ if ((ev & EPOLLIN) != 0U) {
+              state.connection.NotifyReadable();
+           }
+              │
+              ├─ read_ready_ = true  ← 标记读就绪
+              │
+              └─ ResumeWaiter(read_waiter_)
+                    │
+                    ├─ 检查 waiter 是否有效
+                    ├─ 保存 handle，清空 waiter（防重入）
+                    └─ handle.resume()  ← 恢复协程
+
+Step 5: 协程恢复，ReadableAwaiter::await_resume() 执行
+        │
+        ├─ read_ready_ = false  ← 清除就绪标志
+        │
+        └─ co_await 完成，返回 void
+
+Step 6: ReadRequestCo 协程继续执行
+        │
+        ├─ 检查 ShouldClose()?
+        │     └─ 是 → co_return true（正常关闭）
+        │
+        └─ 调用 OnReadable(error_msg)
+              │
+              ├─ ReadFromSocket() 
+              │     │
+              │     └─ ::recv(fd_, chunk, 4096, 0)  ◄═══ 实际读 I/O
+              │
+              ├─ TryParseRequests() 解析请求
+              │     └─ HandleOneRequest() 调用用户处理函数
+              │
+              └─ QueueResponse() 将响应加入写缓冲区
+
+================================================================================
+                              协程等待可写事件流程
+================================================================================
+
+Step 1: 服务协程调用 WriteResponseCo()
+        │
+        ├─ 快速路径检查：HasPendingWrite()?
+        │     └─ 否 → co_return true（无数据需要发送）
+        │
+        └─ co_await WaitWritableCo()  ← 创建 WritableAwaiter
+
+Step 2: WritableAwaiter::await_ready() 检查状态
+        │
+        ├─ should_close_ == true?
+        │     └─ 是 → 返回 true，无需等待
+        │
+        ├─ write_ready_ == true?
+        │     └─ 是 → 返回 true，socket 已可写
+        │
+        └─ 否 → 返回 false，需要挂起
+
+Step 3: WritableAwaiter::await_suspend(handle) 挂起协程
+        │
+        ├─ 再次检查条件（防止竞态）
+        ├─ 保存协程句柄到 write_waiter_
+        │     connection_->write_waiter_ = handle
+        │
+        └─ 返回 true → 协程挂起
+
+        ... 协程挂起中，等待 socket 可写 ...
+        ... 通常 socket 总是可写，除非发送缓冲区满 ...
+
+Step 4: 事件循环检测到 socket 可写 (EPOLLOUT)
+        │
+        │  【代码位置：rpc_server.cpp 第 214-216 行】
+        │
+        └─ if ((ev & EPOLLOUT) != 0U) {
+              state.connection.NotifyWritable();
+           }
+              │
+              ├─ write_ready_ = true
+              └─ ResumeWaiter(write_waiter_)
+                    └─ handle.resume()
+
+Step 5: 协程恢复，WritableAwaiter::await_resume() 执行
+        │
+        ├─ write_ready_ = false
+        └─ co_await 完成
+
+Step 6: WriteResponseCo 协程继续执行
+        │
+        ├─ 检查 ShouldClose()?
+        │     └─ 是 → co_return true
+        │
+        └─ 调用 OnWritable(error_msg)
+              │
+              └─ FlushWrites()
+                    │
+                    └─ ::send(fd_, buffer, size, MSG_NOSIGNAL)  ◄═══ 实际写 I/O
+
+================================================================================
+                              连接关闭时的协程清理
+================================================================================
+
+Step 1: 连接需要关闭（对端关闭/错误/显式标记）
+        │
+        │  【代码位置：rpc_server.cpp 第 217-220 行】
+        │
+        └─ if ((ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
+              state.connection.MarkClosing();
+              state.connection.NotifyReadable();
+              state.connection.NotifyWritable();
+           }
+              │
+              ├─ should_close_ = true
+              │
+              ├─ ResumeWaiter(read_waiter_)   ← 唤醒读等待协程
+              │     └─ 协程恢复后检测到 should_close_，正常退出
+              │
+              └─ ResumeWaiter(write_waiter_)  ← 唤醒写等待协程
+                    └─ 协程恢复后检测到 should_close_，正常退出
+
+================================================================================
+                              状态变量说明
+================================================================================
+
+Connection 类中的协程相关成员变量：
+
+┌─────────────────┬──────────────────────────────────────────────────────┐
+│     变量        │                      说明                            │
+├─────────────────┼──────────────────────────────────────────────────────┤
+│ should_close_   │ 连接是否应该关闭，用于协程取消检测                    │
+│ read_ready_     │ socket 是否可读，避免不必要的挂起                     │
+│ write_ready_    │ socket 是否可写，避免不必要的挂起                     │
+│ read_waiter_    │ 等待可读事件的协程句柄                               │
+│ write_waiter_   │ 等待可写事件的协程句柄                               │
+└─────────────────┴──────────────────────────────────────────────────────┘
+
+================================================================================
+                              时序图：完整的请求处理流程
+================================================================================
+
+  事件循环                Connection              服务协程               Awaiter
+  (RpcServer)                │                      │                     │
+     │                       │                      │                     │
+     │                       │  ReadRequestCo()     │                     │
+     │                       │←─────────────────────│                     │
+     │                       │                      │                     │
+     │                       │  WaitReadableCo()    │                     │
+     │                       │─────────────────────→│                     │
+     │                       │                      │  await_ready()      │
+     │                       │                      │────────────────────→│
+     │                       │                      │←────── false ───────│
+     │                       │                      │  await_suspend()    │
+     │                       │                      │────────────────────→│
+     │                       │                      │                     │
+     │   [协程挂起，控制权返回事件循环]                                      │
+     │                       │                      │                     │
+     │  epoll_wait() 阻塞等待 │                      │                     │
+     │       ...             │                      │                     │
+     │  客户端发送数据到达    │                      │                     │
+     │       ...             │                      │                     │
+     │  epoll_wait() 返回    │                      │                     │
+     │  EPOLLIN 事件         │                      │                     │
+     │                       │                      │                     │
+     │  NotifyReadable()     │                      │                     │
+     │──────────────────────→│                      │                     │
+     │                       │  ResumeWaiter()      │                     │
+     │                       │─────────────────────────────────────────→  │
+     │                       │                      │←──── resume ────────│
+     │                       │                      │  await_resume()     │
+     │                       │                      │←────────────────────│
+     │                       │                      │                     │
+     │                       │  OnReadable()        │                     │
+     │                       │←─────────────────────│                     │
+     │                       │                      │                     │
+     │                       │  ReadFromSocket()    │                     │
+     │                       │    └─► recv() ◄═══════════ 实际读 I/O
+     │                       │                      │                     │
+     │                       │  [处理请求，生成响应] │                     │
+     │                       │                      │                     │
+     │                       │  WriteResponseCo()   │                     │
+     │                       │←─────────────────────│                     │
+     │                       │                      │                     │
+     │                       │  OnWritable()        │                     │
+     │                       │    └─► send() ◄═══════════ 实际写 I/O      │
+     │                       │                      │                     │
+
+                              关键代码位置索引
+
+【rpc_server.cpp】事件循环和协程调度
+    │
+    ├─ 第 32-54 行：HandleConnectionCo() 协程函数
+    │     └─ 服务连接的主协程，循环读取请求并发送响应
+    │
+    ├─ 第 157-162 行：新连接创建时启动协程
+    │     state->task.emplace(HandleConnectionCo(...))
+    │
+    ├─ 第 211-213 行：处理 EPOLLIN 事件
+    │     state.connection.NotifyReadable()
+    │
+    ├─ 第 214-216 行：处理 EPOLLOUT 事件
+    │     state.connection.NotifyWritable()
+    │
+    └─ 第 217-220 行：处理连接关闭事件
+          state.connection.MarkClosing()
+
+【connection.cpp】I/O 操作和协程等待
+    │
+    ├─ 第 324-333 行：ReadRequestCo() 协程
+    │     └─ co_await WaitReadableCo() → OnReadable()
+    │
+    ├─ 第 366-385 行：WriteResponseCo() 协程
+    │     └─ co_await WaitWritableCo() → OnWritable()
+    │
+    ├─ 第 403-411 行：NotifyReadable()
+    │     └─ 唤醒等待可读事件的协程
+    │
+    ├─ 第 427-439 行：ResumeWaiter()
+    │     └─ 安全恢复挂起的协程
+    │
+    ├─ 第 583-627 行：ReadFromSocket()
+    │     └─ ::recv() 实际读 I/O
+    │
+    └─ 第 714-757 行：FlushWrites()
+          └─ ::send() 实际写 I/O
+
+                              客户端 vs 服务端 对比
+
+【客户端 I/O 模型】主动发起
+    │
+    ├─ 主动建立连接
+    ├─ 主动发送请求 → send()
+    ├─ 等待响应到达
+    └─ 主动接收响应 → recv()
+
+【服务端 I/O 模型】被动响应
+    │
+    ├─ 被动接受连接 → accept()
+    ├─ 等待请求到达（epoll 监听）
+    ├─ 被动接收请求 → recv()（数据已到达）
+    └─ 发送响应 → send()（处理完成后）
+
+【核心区别】
+    服务端不需要"发起"I/O 请求！
+    - 客户端：主动发送请求，然后等待响应
+    - 服务端：等待数据到达，然后读取处理
+    - 服务端的 recv() 只是读取已经到达的数据，不会阻塞
+
+</content>

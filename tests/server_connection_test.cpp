@@ -272,10 +272,15 @@ int main() {
       assert(resp.payload().back() == 'x');
     });
 
-    for (int i = 0; i < 1024 && nb_connection.HasPendingWrite(); ++i) {
+    int drain_guard = 0;
+    while (nb_connection.HasPendingWrite() && drain_guard < 500000) {
       assert(nb_connection.OnWritable(&error));
       if (nb_connection.ShouldClose()) {
         break;
+      }
+      ++drain_guard;
+      if ((drain_guard % 256) == 0) {
+        std::this_thread::yield();
       }
     }
 
