@@ -9,12 +9,13 @@
 本阶段已从纯阻塞式连接处理，演进到轻量 event loop / reactor 雏形。
 
 服务端当前定位：
-- 已从“accept 一个连接后阻塞处理到断开”演进为“单线程 epoll + 多 Connection 驱动”
-- `Connection` 负责连接级协议解析、读写缓冲与响应排队
-- `RpcServer` 负责 listen/accept、epoll 事件循环与连接生命周期管理
+- 已从“accept 一个连接后阻塞处理到断开”演进为“Acceptor + WorkerLoop + Connection”分层
+- `RpcServer` 现在主要承担 Acceptor（listen/accept/分发）职责
+- `WorkerLoop` 负责连接所属 epoll、连接 map、连接协程主路径驱动
+- `Connection` 负责连接级协议解析、读写缓冲、awaiter、状态机与收敛
 - 已进一步演进为“连接级 coroutine 主路径”：`HandleConnectionCo` 驱动读请求/执行业务/写响应
 - epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
-- Connection 增加轻量状态机与连接收敛策略（关闭/错误/超时/背压）
+- 当前只运行单 worker loop，但结构已为 one-loop-per-thread / 多 reactor 做准备
 - 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
@@ -77,12 +78,15 @@
   - `Find()` 返回引用包装，避免复制 `std::function`
 
 - `src/server/rpc_server.*`
-  - TCP 监听/接收连接（全链路 `UniqueFd` 管理）
-  - 单线程 epoll 事件循环，统一管理 listen fd 与多个 client fd
-  - accept 新连接后创建 `Connection` 对象并注册到 epoll
-  - 根据可读/可写事件恢复对应连接协程的等待点
-  - `HandleConnectionCo` 作为连接主处理路径
-  - 通过事件循环 tick 检查连接 deadline，超时后统一收敛退出
+  - Acceptor 角色：listen socket 初始化、accept 新连接
+  - 将新连接分发给 WorkerLoop（当前固定单 worker）
+
+- `src/server/worker_loop.*`
+  - 持有 worker 专属 epoll fd 与 connection map
+  - 注册/移除 client fd
+  - 驱动连接可读/可写事件与连接协程主路径
+  - 执行连接 timeout tick 与关闭收敛
+  - 当前单线程运行，但接口为未来多 worker 预留
 
 - `src/server/connection.*`
   - 连接级状态对象：`fd + read_buffer + write_buffer`
@@ -381,6 +385,11 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - 读超时/写超时收敛退出
   - 背压阈值触发时进入错误收敛
 
+- `server_worker_loop_test`：WorkerLoop 结构性验证
+  - 单 worker 初始化和连接接管
+  - WorkerLoop 驱动连接请求处理并返回响应
+  - 对端关闭后连接由 WorkerLoop 收敛清理
+
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
   - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
@@ -438,6 +447,7 @@ cd rpc_project/build
 - 当前是“连接级 coroutine 主路径 + 单线程 epoll”阶段，不是完整 coroutine runtime
 - 不引入多线程 reactor / io_uring，继续以单线程 epoll 作为 I/O readiness 基座
 - 后续可继续增加连接协程的 deadline、取消、背压策略与更细粒度状态机
+- 架构扩展路径：在保持 Connection 线程亲和前提下，将单 worker 扩展为多个 WorkerLoop（one-loop-per-thread）
 
 coroutine API 的后续演进方向：
 - 进一步减少 bridge 残余路径与对象复制开销

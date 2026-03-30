@@ -2,9 +2,8 @@
  * @file rpc_server.h
  * @brief RPC 服务端核心模块
  *
- * 本文件定义了 RpcServer 类，是 RPC 框架服务端的核心组件。
- * RpcServer 负责监听客户端连接、管理事件循环，并将请求分发给对应的 Connection
- * 处理。
+ * 本文件定义了 RpcServer 类（当前为 acceptor 角色）。
+ * RpcServer 负责监听客户端连接并把连接分发到 WorkerLoop。
  *
  * ## 架构概述
  *
@@ -13,8 +12,8 @@
  *                    |       RpcServer        |
  *                    |------------------------|
  *                    |  listen_fd_ (socket)   |
- *                    |  epoll_fd_ (事件循环)   |
- *                    |  connections_ (连接表)  |
+ *                    |  acceptor listen fd     |
+ *                    |  worker loops            |
  *                    +------------------------+
  *                              |
  *          +-------------------+-------------------+
@@ -33,14 +32,13 @@
  *    - 绑定端口并开始监听
  *    - 创建 epoll 实例
  *
- * 2. **事件循环阶段**
- *    - 等待 epoll 事件
- *    - 处理新连接（listen fd 可读）
- *    - 处理现有连接的读写事件
+ * 2. **接入分发阶段**
+ *    - 等待 listen fd 就绪
+ *    - accept 新连接
+ *    - 分发给某个 WorkerLoop（当前固定单 worker）
  *
- * 3. **连接管理**
- *    - 新连接到来时创建 Connection 对象
- *    - 连接错误或关闭时清理资源
+ * 3. **Worker 驱动阶段**
+ *    - WorkerLoop 负责连接 epoll 驱动、协程推进和连接生命周期
  *
  * ## 使用示例
  *
@@ -59,7 +57,8 @@
  *
  * ## 设计特点
  *
- * - **单线程模型**：使用 epoll 实现高效的单线程事件驱动
+ * - **结构先行**：Acceptor 与 WorkerLoop 职责分离
+ * - **单 worker 运行**：当前仅创建一个 WorkerLoop
  * - **非阻塞 I/O**：所有 socket 均为非阻塞模式
  * - **RAII 资源管理**：使用 UniqueFd 自动管理文件描述符
  * - **优雅关闭**：连接关闭时自动清理 epoll 注册
@@ -83,10 +82,10 @@ namespace rpc::server {
  * @class RpcServer
  * @brief 单线程 epoll RPC 服务端
  *
- * RpcServer 是 RPC 框架的核心服务端类，负责：
+ * RpcServer 负责：
  * - 监听指定端口的客户端连接
- * - 管理 epoll 事件循环
- * - 分发请求到对应的 Connection 处理
+ * - accept 新连接
+ * - 将连接分发给 WorkerLoop（当前单 worker）
  *
  * ## 核心职责
  *
@@ -95,22 +94,18 @@ namespace rpc::server {
  *    - 使用 accept4 创建非阻塞客户端 socket
  *    - 将新连接注册到 epoll
  *
- * 2. **事件分发**
- *    - 监听 EPOLLIN、EPOLLOUT、EPOLLRDHUP 等事件
- *    - 根据事件类型调用 Connection 的相应方法
- *    - 动态调整 epoll 事件注册
+ * 2. **连接分发**
+ *    - 将新连接交给 WorkerLoop 接管
  *
- * 3. **生命周期管理**
- *    - 维护所有活跃连接的映射表
- *    - 连接关闭时清理资源
+ * 3. **线程边界**
+ *    - RpcServer 不直接驱动 Connection
+ *    - Connection 归属某个 WorkerLoop
  *
  * ## 线程模型
  *
- * RpcServer 采用单线程事件驱动模型：
- * - 所有 I/O 操作在主线程完成
- * - 使用非阻塞 socket 避免阻塞
- * - epoll 实现高效的多路复用
- * - 连接处理逻辑可通过连接级协程按顺序风格推进
+ * 当前实现仍为单线程运行：
+ * - acceptor 与单 worker 在同一线程调度
+ * - 结构上已可平滑扩展到 one-loop-per-thread
  *
  * @note 服务端目前不支持优雅关闭，调用 Start() 后将无限循环
  */

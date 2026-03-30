@@ -25,6 +25,7 @@ add_library(rpc_framework
     src/protocol/codec.cpp
     src/server/service_registry.cpp
     src/server/connection.cpp
+    src/server/worker_loop.cpp
     src/server/rpc_server.cpp
     src/client/event_loop.cpp
     src/client/pending_calls.cpp
@@ -262,6 +263,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME server_connection_coroutine_test COMMAND server_connection_coroutine_test)
+
+    add_executable(server_worker_loop_test
+        tests/server_worker_loop_test.cpp
+    )
+
+    target_link_libraries(server_worker_loop_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME server_worker_loop_test COMMAND server_worker_loop_test)
 
     add_executable(server_multi_connection_test
         tests/server_multi_connection_test.cpp
