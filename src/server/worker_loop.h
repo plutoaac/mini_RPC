@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 #include "common/unique_fd.h"
@@ -27,6 +28,7 @@ class WorkerLoop {
 
   [[nodiscard]] std::size_t WorkerId() const noexcept;
   [[nodiscard]] std::size_t ConnectionCount() const noexcept;
+  [[nodiscard]] bool IsOnOwnerThread() const noexcept;
 
  private:
   struct ConnectionState {
@@ -40,11 +42,13 @@ class WorkerLoop {
   };
 
   bool CloseConnection(int fd, std::string_view reason);
+  bool EnsureOwnerThread(std::string* error_msg) const;
 
   std::size_t worker_id_;
   const ServiceRegistry& registry_;
   rpc::common::UniqueFd epoll_fd_;
   std::unordered_map<int, std::unique_ptr<ConnectionState>> connections_;
+  std::thread::id owner_thread_id_{};
 };
 
 }  // namespace rpc::server

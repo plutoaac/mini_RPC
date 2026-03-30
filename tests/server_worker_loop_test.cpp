@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "protocol/codec.h"
 #include "rpc.pb.h"
@@ -130,10 +131,31 @@ void TestWorkerLoopSingleWorkerReadiness() {
   assert(worker.ConnectionCount() == 0U);
 }
 
+void TestWorkerLoopThreadAffinityBoundary() {
+  rpc::server::ServiceRegistry registry;
+  rpc::server::WorkerLoop worker(0U, registry);
+
+  std::string error;
+  assert(worker.Init(&error));
+  assert(worker.IsOnOwnerThread());
+
+  bool poll_ok = true;
+  std::string cross_thread_error;
+  std::thread cross_thread([&]() {
+    assert(!worker.IsOnOwnerThread());
+    poll_ok = worker.PollOnce(0, &cross_thread_error);
+  });
+  cross_thread.join();
+
+  assert(!poll_ok);
+  assert(cross_thread_error.find("non-owner thread") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
   TestWorkerLoopSingleWorkerReadiness();
+  TestWorkerLoopThreadAffinityBoundary();
   std::cout << "server_worker_loop_test passed\n";
   return 0;
 }

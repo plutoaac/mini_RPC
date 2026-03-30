@@ -37,11 +37,13 @@
 #include <fcntl.h>       // fcntl, O_NONBLOCK
 #include <sys/socket.h>  // recv, send, MSG_NOSIGNAL
 
-#include <cerrno>       // errno, EINTR, EAGAIN, EWOULDBLOCK
+#include <cerrno>  // errno, EINTR, EAGAIN, EWOULDBLOCK
+#include <cstdlib>
 #include <cstring>      // strerror
 #include <exception>    // std::exception
 #include <string>       // std::string
 #include <string_view>  // std::string_view
+#include <thread>
 
 #include "common/log.h"               // 日志输出
 #include "common/rpc_error.h"         // RPC 错误定义
@@ -102,6 +104,8 @@ Connection::Connection(rpc::common::UniqueFd fd,
  * 读取 socket 数据并尝试解析处理请求。
  */
 bool Connection::OnReadable(std::string* error_msg) {
+  AssertOwnerThread();
+
   // 从 socket 读取数据
   const ReadResult read_result = ReadFromSocket(error_msg);
 
@@ -137,6 +141,8 @@ bool Connection::OnReadable(std::string* error_msg) {
  * 发送写缓冲区中的数据。
  */
 bool Connection::OnWritable(std::string* error_msg) {
+  AssertOwnerThread();
+
   if (!FlushWrites(error_msg)) {
     EnterError(error_msg == nullptr ? "write error" : *error_msg);
     return false;
@@ -187,12 +193,34 @@ const std::string& Connection::LastError() const noexcept {
   return last_error_;
 }
 
+void Connection::BindToWorkerLoop(std::size_t worker_id) noexcept {
+  owner_worker_id_ = worker_id;
+  owner_thread_id_ = std::this_thread::get_id();
+}
+
+bool Connection::IsBoundToWorkerLoop() const noexcept {
+  return owner_worker_id_.has_value();
+}
+
+std::optional<std::size_t> Connection::OwnerWorkerId() const noexcept {
+  return owner_worker_id_;
+}
+
+bool Connection::IsOnOwnerThread() const noexcept {
+  if (owner_thread_id_ == std::thread::id{}) {
+    return true;
+  }
+  return owner_thread_id_ == std::this_thread::get_id();
+}
+
 /**
  * @brief 将连接标记为即将关闭
  *
  * 同时唤醒所有等待中的协程，使其能够正常退出。
  */
 void Connection::MarkClosing() noexcept {
+  AssertOwnerThread();
+
   if (state_ != State::kClosed && state_ != State::kError) {
     state_ = State::kClosing;
   }
@@ -205,6 +233,8 @@ void Connection::MarkClosing() noexcept {
 }
 
 void Connection::MarkClosed() noexcept {
+  AssertOwnerThread();
+
   should_close_ = true;
   state_ = State::kClosed;
   read_ready_ = false;
@@ -216,6 +246,8 @@ void Connection::MarkClosed() noexcept {
 }
 
 void Connection::Tick(std::chrono::steady_clock::time_point now) noexcept {
+  AssertOwnerThread();
+
   if (state_ == State::kClosed || state_ == State::kError || should_close_) {
     return;
   }
@@ -465,6 +497,8 @@ rpc::coroutine::Task<bool> Connection::WriteResponseCo(std::string* error_msg) {
  * @note 此方法通常在事件循环线程中调用
  */
 void Connection::NotifyReadable() noexcept {
+  AssertOwnerThread();
+
   // 标记读就绪状态
   read_ready_ = true;
   state_ = State::kReading;
@@ -490,6 +524,8 @@ void Connection::NotifyReadable() noexcept {
  * @note 此方法通常在事件循环线程中调用
  */
 void Connection::NotifyWritable() noexcept {
+  AssertOwnerThread();
+
   // 标记写就绪状态
   write_ready_ = true;
   state_ = State::kWriting;
@@ -526,6 +562,16 @@ void Connection::ResumeWaiter(std::coroutine_handle<>& waiter) noexcept {
   waiter = {};
   // 恢复协程执行
   handle.resume();
+}
+
+void Connection::AssertOwnerThread() const noexcept {
+#ifndef NDEBUG
+  if (!IsOnOwnerThread()) {
+    common::LogError(
+        "connection accessed from non-owner thread (worker-owned object)");
+    std::abort();
+  }
+#endif
 }
 
 void Connection::EnterError(std::string message) noexcept {

@@ -13,6 +13,7 @@
 - `RpcServer` 现在主要承担 Acceptor（listen/accept/分发）职责
 - `WorkerLoop` 负责连接所属 epoll、连接 map、连接协程主路径驱动
 - `Connection` 负责连接级协议解析、读写缓冲、awaiter、状态机与收敛
+- `Connection` 明确归属单一 `WorkerLoop`，并约束只在 owner worker 线程访问
 - 已进一步演进为“连接级 coroutine 主路径”：`HandleConnectionCo` 驱动读请求/执行业务/写响应
 - epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
 - 当前只运行单 worker loop，但结构已为 one-loop-per-thread / 多 reactor 做准备
@@ -80,12 +81,14 @@
 - `src/server/rpc_server.*`
   - Acceptor 角色：listen socket 初始化、accept 新连接
   - 将新连接分发给 WorkerLoop（当前固定单 worker）
+  - 当前运行模型：acceptor 与唯一 worker 在同一线程调度
 
 - `src/server/worker_loop.*`
   - 持有 worker 专属 epoll fd 与 connection map
   - 注册/移除 client fd
   - 驱动连接可读/可写事件与连接协程主路径
   - 执行连接 timeout tick 与关闭收敛
+  - 明确线程亲和：worker loop 只允许 owner 线程调用
   - 当前单线程运行，但接口为未来多 worker 预留
 
 - `src/server/connection.*`
@@ -101,6 +104,22 @@
   - 新增连接状态机：`Open/Reading/Writing/Closing/Closed/Error`
   - 新增连接级 deadline：读超时、写超时可触发协程收敛退出
   - 新增轻量背压保护：`write_buffer` 超阈值时返回错误并进入收敛路径
+  - 明确连接归属：连接绑定 owner worker，非 owner 线程访问属于误用
+
+## 服务端演进说明（当前阶段）
+
+当前版本的服务端不是多线程 reactor，也不是 io_uring 版本。
+
+本次抽象的价值：
+- 先固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
+- 先固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
+- 保持单 worker 运行，便于学习、调试和验证 coroutine 主路径
+
+下一步扩展到 one-loop-per-thread / 多 reactor 时，只需要：
+1. 创建多个 `WorkerLoop`（每个 worker 绑定一个线程）
+2. 将 `RpcServer` 的分发策略从固定单 worker 扩展为轮询或哈希分发
+3. 在 accept 线程与 worker 线程之间引入连接移交通道（如 eventfd + queue）
+4. 保持 `Connection` 不跨线程访问，继续复用现有协程读写主路径
 
 - `src/client/rpc_client.*`
   - 连接服务端

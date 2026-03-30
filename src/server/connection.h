@@ -80,6 +80,7 @@
 #include <optional>   // std::optional
 #include <string>     // std::string
 #include <string_view>
+#include <thread>
 
 #include "common/unique_fd.h"  // RAII 文件描述符封装
 #include "coroutine/task.h"
@@ -272,6 +273,12 @@ class Connection {
   [[nodiscard]] State GetState() const noexcept;
   [[nodiscard]] const char* StateName() const noexcept;
   [[nodiscard]] const std::string& LastError() const noexcept;
+
+  // 绑定连接到某个 WorkerLoop。当前线程会被记录为 owner thread。
+  void BindToWorkerLoop(std::size_t worker_id) noexcept;
+  [[nodiscard]] bool IsBoundToWorkerLoop() const noexcept;
+  [[nodiscard]] std::optional<std::size_t> OwnerWorkerId() const noexcept;
+  [[nodiscard]] bool IsOnOwnerThread() const noexcept;
 
   /**
    * @brief 将连接标记为即将关闭
@@ -468,6 +475,7 @@ class Connection {
                                               std::string* error_msg);
 
   void ResumeWaiter(std::coroutine_handle<>& waiter) noexcept;
+  void AssertOwnerThread() const noexcept;
   void EnterError(std::string message) noexcept;
   void ArmReadDeadline() noexcept;
   void ArmWriteDeadline() noexcept;
@@ -523,6 +531,9 @@ class Connection {
   std::optional<std::chrono::steady_clock::time_point> write_deadline_;
   std::coroutine_handle<> read_waiter_{};
   std::coroutine_handle<> write_waiter_{};
+
+  std::optional<std::size_t> owner_worker_id_;
+  std::thread::id owner_thread_id_{};
 };
 
 }  // namespace rpc::server

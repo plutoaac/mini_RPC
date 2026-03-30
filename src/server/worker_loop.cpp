@@ -42,6 +42,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include "common/log.h"
 
@@ -160,6 +161,7 @@ bool WorkerLoop::Init(std::string* error_msg) {
     }
     return false;
   }
+  owner_thread_id_ = std::this_thread::get_id();
   return true;
 }
 
@@ -170,6 +172,10 @@ bool WorkerLoop::Init(std::string* error_msg) {
 bool WorkerLoop::AddConnection(rpc::common::UniqueFd fd,
                                std::string_view peer_desc,
                                std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
   // 检查 epoll 是否已初始化
   if (!epoll_fd_) {
     if (error_msg != nullptr) {
@@ -197,6 +203,7 @@ bool WorkerLoop::AddConnection(rpc::common::UniqueFd fd,
   // - Connection 封装了 socket I/O 和协议处理
   // - Task 存储协程的执行状态
   auto state = std::make_unique<ConnectionState>(std::move(fd), registry_);
+  state->connection.BindToWorkerLoop(worker_id_);
 
   // 启动协程：协程开始执行，遇到第一个 co_await 时挂起
   state->task.emplace(HandleConnectionCo(
@@ -224,6 +231,10 @@ bool WorkerLoop::AddConnection(rpc::common::UniqueFd fd,
 // ============================================================================
 
 bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
   if (!epoll_fd_) {
     if (error_msg != nullptr) {
       *error_msg = "worker loop not initialized";
@@ -354,6 +365,13 @@ std::size_t WorkerLoop::ConnectionCount() const noexcept {
   return connections_.size();
 }
 
+bool WorkerLoop::IsOnOwnerThread() const noexcept {
+  if (owner_thread_id_ == std::thread::id{}) {
+    return true;
+  }
+  return owner_thread_id_ == std::this_thread::get_id();
+}
+
 // ============================================================================
 // 连接关闭
 // ============================================================================
@@ -392,6 +410,16 @@ bool WorkerLoop::CloseConnection(int fd, std::string_view reason) {
                   " closed connection fd=" + std::to_string(fd) +
                   " reason: " + std::string(reason));
   return true;
+}
+
+bool WorkerLoop::EnsureOwnerThread(std::string* error_msg) const {
+  if (IsOnOwnerThread()) {
+    return true;
+  }
+  if (error_msg != nullptr) {
+    *error_msg = "worker loop accessed from non-owner thread";
+  }
+  return false;
 }
 
 }  // namespace rpc::server

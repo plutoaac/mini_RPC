@@ -21,6 +21,13 @@ namespace {
 
 constexpr int kAcceptPollTimeoutMs = 100;
 
+WorkerLoop& SelectWorker(std::vector<WorkerLoop>& workers,
+                         std::size_t* next_worker) {
+  WorkerLoop& selected = workers[*next_worker];
+  *next_worker = (*next_worker + 1) % workers.size();
+  return selected;
+}
+
 }  // namespace
 
 RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry)
@@ -138,8 +145,7 @@ bool RpcServer::Start() {
           const std::string peer = std::string(ip) + ':' +
                                    std::to_string(ntohs(client_addr.sin_port));
 
-          WorkerLoop& worker = workers[next_worker];
-          next_worker = (next_worker + 1) % workers.size();
+          WorkerLoop& worker = SelectWorker(workers, &next_worker);
 
           std::string add_error;
           if (!worker.AddConnection(common::UniqueFd(client_raw_fd), peer,
