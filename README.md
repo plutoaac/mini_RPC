@@ -12,7 +12,9 @@
 - 已从“accept 一个连接后阻塞处理到断开”演进为“单线程 epoll + 多 Connection 驱动”
 - `Connection` 负责连接级协议解析、读写缓冲与响应排队
 - `RpcServer` 负责 listen/accept、epoll 事件循环与连接生命周期管理
-- 已引入“连接级 coroutine 雏形”：epoll 继续负责 readiness，连接协程负责顺序化读写流程
+- 已进一步演进为“连接级 coroutine 主路径”：`HandleConnectionCo` 驱动读请求/执行业务/写响应
+- epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
+- Connection 增加轻量状态机与连接收敛策略（关闭/错误/超时/背压）
 - 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
@@ -79,7 +81,8 @@
   - 单线程 epoll 事件循环，统一管理 listen fd 与多个 client fd
   - accept 新连接后创建 `Connection` 对象并注册到 epoll
   - 根据可读/可写事件恢复对应连接协程的等待点
-  - 连接处理流程可按 `Task<void> HandleConnectionCo(Connection&)` 逐步演进
+  - `HandleConnectionCo` 作为连接主处理路径
+  - 通过事件循环 tick 检查连接 deadline，超时后统一收敛退出
 
 - `src/server/connection.*`
   - 连接级状态对象：`fd + read_buffer + write_buffer`
@@ -91,6 +94,9 @@
   - 新增协程接口：`ReadRequestCo/WriteResponseCo`
   - 新增协程等待点：`WaitReadableCo/WaitWritableCo`
   - 新增 epoll 通知恢复入口：`NotifyReadable/NotifyWritable`
+  - 新增连接状态机：`Open/Reading/Writing/Closing/Closed/Error`
+  - 新增连接级 deadline：读超时、写超时可触发协程收敛退出
+  - 新增轻量背压保护：`write_buffer` 超阈值时返回错误并进入收敛路径
 
 - `src/client/rpc_client.*`
   - 连接服务端
@@ -220,6 +226,13 @@ rpc::client::RpcClient client(
 ```
 
 说明：当前版本基于 `SO_SNDTIMEO` / `SO_RCVTIMEO`，后续可升级到更细粒度的 per-request deadline。
+
+服务端连接级超时（新增）：
+
+- `Connection` 提供读/写 deadline（默认 5s）
+- 连接协程在等待可读/可写事件时会自动挂载对应 deadline
+- `RpcServer` 事件循环通过 tick 检查超时并触发连接收敛
+- 超时后连接进入 `Error`，并唤醒等待协程退出
 
 ## 9. CallAsync（future-like 最小版本）
 
@@ -361,9 +374,12 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - 非法请求 protobuf 返回 `PARSE_ERROR`
 
 - `server_connection_coroutine_test`：服务端连接协程雏形
-  - `ReadRequestCo/WriteResponseCo` 的读写成功路径
-  - 半包输入下协程可挂起并在下一次可读事件恢复
-  - 写阶段在可写事件到达后恢复并发送响应
+  - 协程主路径（读请求->处理->写响应）
+  - 半包输入挂起与恢复
+  - 写部分完成挂起与恢复
+  - 对端关闭收敛退出
+  - 读超时/写超时收敛退出
+  - 背压阈值触发时进入错误收敛
 
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
@@ -419,7 +435,7 @@ cd rpc_project/build
 - `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
 
 服务端 coroutine 方向说明：
-- 当前是连接级 coroutine 雏形，不是完整 coroutine runtime
+- 当前是“连接级 coroutine 主路径 + 单线程 epoll”阶段，不是完整 coroutine runtime
 - 不引入多线程 reactor / io_uring，继续以单线程 epoll 作为 I/O readiness 基座
 - 后续可继续增加连接协程的 deadline、取消、背压策略与更细粒度状态机
 

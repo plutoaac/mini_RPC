@@ -81,7 +81,11 @@ constexpr std::size_t kMaxFrameSize = 4 * 1024 * 1024;
  */
 Connection::Connection(rpc::common::UniqueFd fd,
                        const ServiceRegistry& registry)
-    : fd_(std::move(fd)), registry_(registry) {
+    : Connection(std::move(fd), registry, Options{}) {}
+
+Connection::Connection(rpc::common::UniqueFd fd,
+                       const ServiceRegistry& registry, Options options)
+    : fd_(std::move(fd)), registry_(registry), options_(options) {
   // 预分配缓冲区容量，减少后续扩容开销
   // 8KB 是一个合理的初始大小，可以容纳大多数 RPC 请求/响应
   read_buffer_.reserve(8192);
@@ -103,13 +107,14 @@ bool Connection::OnReadable(std::string* error_msg) {
 
   // 处理不同的读取结果
   if (read_result == ReadResult::kPeerClosed) {
-    // 对端关闭连接，标记为需要关闭
+    // 对端关闭连接，标记为关闭收敛
+    state_ = State::kClosing;
     should_close_ = true;
     return true;  // 正常情况，不是错误
   }
   if (read_result == ReadResult::kError) {
     // 发生读取错误
-    should_close_ = true;
+    EnterError(error_msg == nullptr ? "read error" : *error_msg);
     return false;
   }
   if (read_result == ReadResult::kWouldBlock) {
@@ -119,9 +124,10 @@ bool Connection::OnReadable(std::string* error_msg) {
 
   // 成功读取数据，尝试解析请求
   if (!TryParseRequests(error_msg)) {
-    should_close_ = true;
+    EnterError(error_msg == nullptr ? "parse/process error" : *error_msg);
     return false;
   }
+  state_ = State::kOpen;
   return true;
 }
 
@@ -132,8 +138,11 @@ bool Connection::OnReadable(std::string* error_msg) {
  */
 bool Connection::OnWritable(std::string* error_msg) {
   if (!FlushWrites(error_msg)) {
-    should_close_ = true;
+    EnterError(error_msg == nullptr ? "write error" : *error_msg);
     return false;
+  }
+  if (!HasPendingWrite()) {
+    state_ = State::kOpen;
   }
   return true;
 }
@@ -154,16 +163,70 @@ bool Connection::HasPendingWrite() const noexcept {
  */
 bool Connection::ShouldClose() const noexcept { return should_close_; }
 
+Connection::State Connection::GetState() const noexcept { return state_; }
+
+const char* Connection::StateName() const noexcept {
+  switch (state_) {
+    case State::kOpen:
+      return "open";
+    case State::kReading:
+      return "reading";
+    case State::kWriting:
+      return "writing";
+    case State::kClosing:
+      return "closing";
+    case State::kClosed:
+      return "closed";
+    case State::kError:
+      return "error";
+  }
+  return "unknown";
+}
+
+const std::string& Connection::LastError() const noexcept {
+  return last_error_;
+}
+
 /**
  * @brief 将连接标记为即将关闭
  *
  * 同时唤醒所有等待中的协程，使其能够正常退出。
  */
 void Connection::MarkClosing() noexcept {
+  if (state_ != State::kClosed && state_ != State::kError) {
+    state_ = State::kClosing;
+  }
   should_close_ = true;
+  ClearReadDeadline();
+  ClearWriteDeadline();
   // 唤醒等待读/写事件的协程，让它们能够检测到关闭状态并退出
   ResumeWaiter(read_waiter_);
   ResumeWaiter(write_waiter_);
+}
+
+void Connection::MarkClosed() noexcept {
+  should_close_ = true;
+  state_ = State::kClosed;
+  read_ready_ = false;
+  write_ready_ = false;
+  ClearReadDeadline();
+  ClearWriteDeadline();
+  read_waiter_ = {};
+  write_waiter_ = {};
+}
+
+void Connection::Tick(std::chrono::steady_clock::time_point now) noexcept {
+  if (state_ == State::kClosed || state_ == State::kError || should_close_) {
+    return;
+  }
+
+  if (read_deadline_.has_value() && now >= *read_deadline_) {
+    EnterError("read timeout");
+    return;
+  }
+  if (write_deadline_.has_value() && now >= *write_deadline_) {
+    EnterError("write timeout");
+  }
 }
 
 // ============================================================================
@@ -312,6 +375,7 @@ Connection::WritableAwaiter Connection::WaitWritableCo() noexcept {
 rpc::coroutine::Task<bool> Connection::ReadRequestCo(std::string* error_msg) {
   // 等待 socket 可读，协程在此处可能挂起
   co_await WaitReadableCo();
+  ClearReadDeadline();
 
   // 检查连接是否已被关闭，如果是则直接返回
   if (ShouldClose()) {
@@ -362,11 +426,13 @@ rpc::coroutine::Task<bool> Connection::ReadRequestCo(std::string* error_msg) {
 rpc::coroutine::Task<bool> Connection::WriteResponseCo(std::string* error_msg) {
   // 快速路径：如果没有待发送数据，直接返回成功
   if (!HasPendingWrite()) {
+    ClearWriteDeadline();
     co_return true;
   }
 
   // 等待 socket 可写，协程在此处可能挂起
   co_await WaitWritableCo();
+  ClearWriteDeadline();
 
   // 检查连接是否已被关闭，如果是则直接返回
   if (ShouldClose()) {
@@ -401,6 +467,7 @@ rpc::coroutine::Task<bool> Connection::WriteResponseCo(std::string* error_msg) {
 void Connection::NotifyReadable() noexcept {
   // 标记读就绪状态
   read_ready_ = true;
+  state_ = State::kReading;
   // 唤醒等待可读事件的协程
   ResumeWaiter(read_waiter_);
 }
@@ -425,6 +492,7 @@ void Connection::NotifyReadable() noexcept {
 void Connection::NotifyWritable() noexcept {
   // 标记写就绪状态
   write_ready_ = true;
+  state_ = State::kWriting;
   // 唤醒等待可写事件的协程
   ResumeWaiter(write_waiter_);
 }
@@ -459,6 +527,30 @@ void Connection::ResumeWaiter(std::coroutine_handle<>& waiter) noexcept {
   // 恢复协程执行
   handle.resume();
 }
+
+void Connection::EnterError(std::string message) noexcept {
+  if (!message.empty()) {
+    last_error_ = std::move(message);
+  }
+  should_close_ = true;
+  state_ = State::kError;
+  ClearReadDeadline();
+  ClearWriteDeadline();
+  ResumeWaiter(read_waiter_);
+  ResumeWaiter(write_waiter_);
+}
+
+void Connection::ArmReadDeadline() noexcept {
+  read_deadline_ = std::chrono::steady_clock::now() + options_.read_timeout;
+}
+
+void Connection::ArmWriteDeadline() noexcept {
+  write_deadline_ = std::chrono::steady_clock::now() + options_.write_timeout;
+}
+
+void Connection::ClearReadDeadline() noexcept { read_deadline_.reset(); }
+
+void Connection::ClearWriteDeadline() noexcept { write_deadline_.reset(); }
 
 // ============================================================================
 // ReadableAwaiter 实现
@@ -516,6 +608,8 @@ bool Connection::ReadableAwaiter::await_suspend(
   }
   // 保存协程句柄，等待 NotifyReadable() 恢复
   connection_->read_waiter_ = handle;
+  connection_->state_ = State::kReading;
+  connection_->ArmReadDeadline();
   return true;  // 真正挂起协程
 }
 
@@ -589,6 +683,8 @@ bool Connection::WritableAwaiter::await_suspend(
   }
   // 保存协程句柄，等待 NotifyWritable() 恢复
   connection_->write_waiter_ = handle;
+  connection_->state_ = State::kWriting;
+  connection_->ArmWriteDeadline();
   return true;  // 真正挂起协程
 }
 
@@ -870,6 +966,14 @@ bool Connection::QueueResponse(const rpc::RpcResponse& response,
   // 编码帧
   std::string frame;
   if (!EncodeFrame(body, &frame, error_msg)) {
+    return false;
+  }
+
+  const std::size_t next_size = write_buffer_.size() + frame.size();
+  if (next_size > options_.max_write_buffer_bytes) {
+    if (error_msg != nullptr) {
+      *error_msg = "write buffer backpressure limit exceeded";
+    }
     return false;
   }
 

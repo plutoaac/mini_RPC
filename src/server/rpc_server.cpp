@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -24,10 +25,12 @@ namespace rpc::server {
 
 namespace {
 
+constexpr int kEpollWaitTimeoutMs = 100;
+
 /**
  * @struct ConnectionState
  * @brief 单个客户端连接的完整状态
- * 
+ *
  * 封装了处理一个客户端连接所需的所有状态：
  * - Connection 对象：负责 socket I/O 操作
  * - 协程任务：异步处理该连接的协程
@@ -40,22 +43,22 @@ struct ConnectionState {
 
   /// Connection 对象：封装 socket I/O 和协程等待机制
   Connection connection;
-  
+
   /// 协程任务：存储 HandleConnectionCo() 协程，Task 存在则协程存在
   std::optional<rpc::coroutine::Task<void>> task;
-  
+
   /// 协程状态标志：false 表示因错误退出
   bool coroutine_ok{true};
-  
+
   /// 错误信息：协程出错时存储具体错误
   std::string coroutine_error;
 };
 
 /**
  * @brief 处理单个客户端连接的协程函数
- * 
+ *
  * 核心协程，在无限循环中：读取请求 → 处理请求 → 发送响应
- * 
+ *
  * ## 两个挂起点
  * - co_await ReadRequestCo()：等待 socket 可读
  * - co_await WriteResponseCo()：等待 socket 可写
@@ -74,6 +77,9 @@ rpc::coroutine::Task<void> HandleConnectionCo(Connection* connection,
     const bool read_ok = co_await connection->ReadRequestCo(coroutine_error);
     if (!read_ok) {
       *coroutine_ok = false;
+      if (coroutine_error->empty()) {
+        *coroutine_error = connection->LastError();
+      }
       co_return;
     }
 
@@ -89,6 +95,9 @@ rpc::coroutine::Task<void> HandleConnectionCo(Connection* connection,
           co_await connection->WriteResponseCo(coroutine_error);
       if (!write_ok) {
         *coroutine_ok = false;
+        if (coroutine_error->empty()) {
+          *coroutine_error = connection->LastError();
+        }
         co_return;
       }
 
@@ -183,11 +192,13 @@ bool RpcServer::Start() {
     common::LogInfo("closing client fd=" + std::to_string(fd) +
                     " reason=" + reason);
     (void)::epoll_ctl(epoll_fd.Get(), EPOLL_CTL_DEL, fd, nullptr);
+    state.connection.MarkClosed();
     connections.erase(it);
   };
 
   while (true) {
-    const int ready = ::epoll_wait(epoll_fd.Get(), events, 64, -1);
+    const int ready =
+        ::epoll_wait(epoll_fd.Get(), events, 64, kEpollWaitTimeoutMs);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
@@ -195,6 +206,12 @@ bool RpcServer::Start() {
       common::LogError(std::string("epoll_wait failed: ") +
                        std::strerror(errno));
       return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [conn_fd, state] : connections) {
+      (void)conn_fd;
+      state->connection.Tick(now);
     }
 
     for (int i = 0; i < ready; ++i) {
@@ -239,19 +256,19 @@ bool RpcServer::Start() {
           // =====================================================================
           // 创建连接状态并启动协程
           // =====================================================================
-          
+
           // 步骤1：创建 ConnectionState 对象
           // - 将 client_raw_fd 封装为 UniqueFd（RAII 管理文件描述符）
           // - 传入 registry_ 引用，用于查找 RPC 方法处理函数
           // - 使用 make_unique 在堆上分配，因为连接状态需要在事件循环中长期存在
           auto state = std::make_unique<ConnectionState>(
               common::UniqueFd(client_raw_fd), registry_);
-          
+
           // 步骤2：启动处理该连接的协程
           // - task 是 std::optional<Task<void>>，初始为空
           // - emplace() 在 optional 内部原地构造 Task 对象
           // - HandleConnectionCo() 返回 Task，代表协程的执行
-          // 
+          //
           // 重要：协程在这里启动，但不会立即执行完！
           // - 协程开始执行，遇到第一个 co_await 时会挂起
           // - 挂起后，控制权返回到这里，继续执行下面的代码
@@ -268,7 +285,7 @@ bool RpcServer::Start() {
           // 步骤3：将连接状态存入 connections map
           // - key：client_raw_fd（socket 文件描述符）
           // - value：unique_ptr<ConnectionState>（连接状态的所有权转移到 map）
-          // 
+          //
           // 结构化绑定：
           // - it：指向插入位置的迭代器（或已存在元素的迭代器）
           // - inserted：是否插入成功（true=新插入，false=key已存在）
@@ -313,7 +330,10 @@ bool RpcServer::Start() {
       }
 
       if (state.connection.ShouldClose()) {
-        close_connection(fd, "peer closed or marked closing");
+        const std::string reason = state.connection.LastError().empty()
+                                       ? "peer closed or marked closing"
+                                       : state.connection.LastError();
+        close_connection(fd, reason);
         continue;
       }
 

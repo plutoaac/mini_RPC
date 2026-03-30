@@ -74,9 +74,12 @@
 
 #pragma once
 
+#include <chrono>     // steady_clock, milliseconds
 #include <coroutine>  // std::coroutine_handle
 #include <cstddef>    // std::size_t
+#include <optional>   // std::optional
 #include <string>     // std::string
+#include <string_view>
 
 #include "common/unique_fd.h"  // RAII 文件描述符封装
 #include "coroutine/task.h"
@@ -134,6 +137,42 @@ class ServiceRegistry;
 class Connection {
  public:
   /**
+   * @brief 连接状态枚举
+   *
+   * 状态转换图：
+   * ```
+   *   kOpen ──┬──> kReading ──> kOpen (读取完成)
+   *           │       │
+   *           │       └──> kError (读取错误)
+   *           │
+   *           ├──> kWriting ──> kOpen (发送完成)
+   *           │       │
+   *           │       └──> kError (发送错误)
+   *           │
+   *           ├──> kClosing ──> kClosed
+   *           │       │
+   *           │       └──> kError (关闭过程中出错)
+   *           │
+   *           └──> kError
+   * ```
+   */
+  enum class State {
+    kOpen,     ///< 连接空闲，可以接受新请求
+    kReading,  ///< 连接正在等待读取数据（协程挂起在 WaitReadableCo）
+    kWriting,  ///< 连接正在等待发送数据（协程挂起在 WaitWritableCo）
+    kClosing,  ///< 连接正在关闭中（收到 EPOLLHUP/EPOLLRDHUP 或调用
+               ///< MarkClosing）
+    kClosed,   ///< 连接已关闭（资源已释放）
+    kError,    ///< 连接发生错误（读/写超时、socket 错误等）
+  };
+
+  struct Options {
+    std::chrono::milliseconds read_timeout{std::chrono::milliseconds(5000)};
+    std::chrono::milliseconds write_timeout{std::chrono::milliseconds(5000)};
+    std::size_t max_write_buffer_bytes{8 * 1024 * 1024};
+  };
+
+  /**
    * @brief 构造 Connection 对象
    *
    * @param fd 客户端 socket 的文件描述符（通过 RAII 封装）
@@ -149,6 +188,8 @@ class Connection {
    * - 预分配缓冲区容量（减少后续重新分配）
    */
   Connection(rpc::common::UniqueFd fd, const ServiceRegistry& registry);
+  Connection(rpc::common::UniqueFd fd, const ServiceRegistry& registry,
+             Options options);
 
   // =========================================================================
   // 事件处理方法
@@ -228,6 +269,9 @@ class Connection {
    * - 调用了 MarkClosing()
    */
   [[nodiscard]] bool ShouldClose() const noexcept;
+  [[nodiscard]] State GetState() const noexcept;
+  [[nodiscard]] const char* StateName() const noexcept;
+  [[nodiscard]] const std::string& LastError() const noexcept;
 
   /**
    * @brief 将连接标记为即将关闭
@@ -236,6 +280,8 @@ class Connection {
    * 通常在收到 EPOLLHUP/EPOLLRDHUP 事件时调用。
    */
   void MarkClosing() noexcept;
+  void MarkClosed() noexcept;
+  void Tick(std::chrono::steady_clock::time_point now) noexcept;
 
   // =========================================================================
   // 同步服务方法
@@ -422,6 +468,11 @@ class Connection {
                                               std::string* error_msg);
 
   void ResumeWaiter(std::coroutine_handle<>& waiter) noexcept;
+  void EnterError(std::string message) noexcept;
+  void ArmReadDeadline() noexcept;
+  void ArmWriteDeadline() noexcept;
+  void ClearReadDeadline() noexcept;
+  void ClearWriteDeadline() noexcept;
 
   // =========================================================================
   // 成员变量
@@ -441,6 +492,8 @@ class Connection {
    */
   const ServiceRegistry& registry_;
 
+  Options options_;
+
   /**
    * @brief 读缓冲区
    *
@@ -455,6 +508,9 @@ class Connection {
    */
   std::string write_buffer_;
 
+  std::string last_error_;
+  State state_{State::kOpen};
+
   /**
    * @brief 关闭标志
    *
@@ -463,6 +519,8 @@ class Connection {
   bool should_close_{false};
   bool read_ready_{false};
   bool write_ready_{false};
+  std::optional<std::chrono::steady_clock::time_point> read_deadline_;
+  std::optional<std::chrono::steady_clock::time_point> write_deadline_;
   std::coroutine_handle<> read_waiter_{};
   std::coroutine_handle<> write_waiter_{};
 };
