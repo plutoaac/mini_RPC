@@ -287,6 +287,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME server_multi_connection_test COMMAND server_multi_connection_test)
+
+    add_executable(server_multi_worker_loop_test
+        tests/server_multi_worker_loop_test.cpp
+    )
+
+    target_link_libraries(server_multi_worker_loop_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME server_multi_worker_loop_test COMMAND server_multi_worker_loop_test)
 endif()
 
 add_executable(rpc_benchmark

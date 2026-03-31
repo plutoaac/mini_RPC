@@ -37,12 +37,16 @@
 #include "server/worker_loop.h"
 
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/log.h"
 
@@ -52,6 +56,7 @@ namespace {
 
 /// 每次 epoll_wait 返回的最大事件数
 constexpr int kMaxEventsPerPoll = 64;
+constexpr int kWorkerPollTimeoutMs = 100;
 
 /**
  * @brief 处理单个客户端连接的协程函数
@@ -151,6 +156,12 @@ rpc::coroutine::Task<void> HandleConnectionCo(Connection* connection,
 WorkerLoop::WorkerLoop(std::size_t worker_id, const ServiceRegistry& registry)
     : worker_id_(worker_id), registry_(registry) {}
 
+WorkerLoop::~WorkerLoop() {
+  // 即使调用方遗漏停止逻辑，也尽量在析构时安全回收线程。
+  RequestStop();
+  Join();
+}
+
 bool WorkerLoop::Init(std::string* error_msg) {
   // 创建 epoll 实例
   // EPOLL_CLOEXEC: exec 时自动关闭 fd，防止泄露给子进程
@@ -161,7 +172,88 @@ bool WorkerLoop::Init(std::string* error_msg) {
     }
     return false;
   }
+
+  wake_fd_ = rpc::common::UniqueFd(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+  if (!wake_fd_) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("eventfd failed: ") + std::strerror(errno);
+    }
+    return false;
+  }
+
+  epoll_event wake_ev{};
+  wake_ev.events = EPOLLIN;
+  wake_ev.data.fd = wake_fd_.Get();
+  if (::epoll_ctl(epoll_fd_.Get(), EPOLL_CTL_ADD, wake_fd_.Get(), &wake_ev) <
+      0) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          std::string("epoll_ctl add wake fd failed: ") + std::strerror(errno);
+    }
+    return false;
+  }
+
   owner_thread_id_ = std::this_thread::get_id();
+  stop_requested_.store(false);
+  return true;
+}
+
+bool WorkerLoop::Start(std::string* error_msg) {
+  if (!epoll_fd_ || !wake_fd_) {
+    if (error_msg != nullptr) {
+      *error_msg = "worker loop not initialized";
+    }
+    return false;
+  }
+  if (thread_.joinable()) {
+    if (error_msg != nullptr) {
+      *error_msg = "worker loop already started";
+    }
+    return false;
+  }
+
+  stop_requested_.store(false);
+  // one-loop-per-thread：每个 WorkerLoop 在独立线程运行 Run()。
+  thread_ = std::thread([this]() { Run(); });
+  return true;
+}
+
+void WorkerLoop::RequestStop() {
+  stop_requested_.store(true);
+  Wakeup();
+}
+
+void WorkerLoop::Join() {
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
+
+bool WorkerLoop::EnqueueConnection(rpc::common::UniqueFd fd,
+                                   std::string peer_desc,
+                                   std::string* error_msg) {
+  if (!fd) {
+    if (error_msg != nullptr) {
+      *error_msg = "invalid client fd";
+    }
+    return false;
+  }
+
+  if (!epoll_fd_ || !wake_fd_) {
+    if (error_msg != nullptr) {
+      *error_msg = "worker loop not initialized";
+    }
+    return false;
+  }
+
+  {
+    // 这里只做投递，不做 epoll 注册，避免跨线程触碰连接对象。
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending_connections_.push_back(
+        PendingConnection{std::move(fd), std::move(peer_desc)});
+  }
+  // 用 eventfd 唤醒 worker 线程，让其尽快接管连接。
+  Wakeup();
   return true;
 }
 
@@ -172,6 +264,16 @@ bool WorkerLoop::Init(std::string* error_msg) {
 bool WorkerLoop::AddConnection(rpc::common::UniqueFd fd,
                                std::string_view peer_desc,
                                std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
+  return AddConnectionOnOwnerThread(std::move(fd), peer_desc, error_msg);
+}
+
+bool WorkerLoop::AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
+                                            std::string_view peer_desc,
+                                            std::string* error_msg) {
   if (!EnsureOwnerThread(error_msg)) {
     return false;
   }
@@ -220,6 +322,9 @@ bool WorkerLoop::AddConnection(rpc::common::UniqueFd fd,
     return false;
   }
 
+  connection_count_.store(connections_.size());
+  total_accepted_count_.fetch_add(1);
+
   common::LogInfo("worker=" + std::to_string(worker_id_) +
                   " adopted connection " + std::string(peer_desc) +
                   " fd=" + std::to_string(raw_fd));
@@ -258,6 +363,23 @@ bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
     return false;
   }
 
+  bool has_wakeup = false;
+  for (int i = 0; i < ready; ++i) {
+    if (events[i].data.fd == wake_fd_.Get()) {
+      has_wakeup = true;
+      break;
+    }
+  }
+  if (has_wakeup) {
+    // wake fd 可能已累积多个写入，先完全 drain，再处理移交队列。
+    if (!DrainWakeFd(error_msg)) {
+      return false;
+    }
+    if (!DrainPendingConnections(error_msg)) {
+      return false;
+    }
+  }
+
   // 步骤2：检查所有连接的超时
   // 即使 epoll_wait 超时（ready == 0），也需要检查超时
   const auto now = std::chrono::steady_clock::now();
@@ -271,6 +393,10 @@ bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
   for (int i = 0; i < ready; ++i) {
     const int fd = events[i].data.fd;
     const std::uint32_t ev = events[i].events;
+
+    if (fd == wake_fd_.Get()) {
+      continue;
+    }
 
     const auto it = connections_.find(fd);
     if (it == connections_.end()) {
@@ -362,7 +488,11 @@ bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
 std::size_t WorkerLoop::WorkerId() const noexcept { return worker_id_; }
 
 std::size_t WorkerLoop::ConnectionCount() const noexcept {
-  return connections_.size();
+  return connection_count_.load();
+}
+
+std::size_t WorkerLoop::TotalAcceptedCount() const noexcept {
+  return total_accepted_count_.load();
 }
 
 bool WorkerLoop::IsOnOwnerThread() const noexcept {
@@ -405,6 +535,7 @@ bool WorkerLoop::CloseConnection(int fd, std::string_view reason) {
   // 步骤5：从 map 移除连接状态
   // 这会触发 ConnectionState 析构，关闭 socket
   connections_.erase(it);
+  connection_count_.store(connections_.size());
 
   common::LogInfo("worker=" + std::to_string(worker_id_) +
                   " closed connection fd=" + std::to_string(fd) +
@@ -420,6 +551,100 @@ bool WorkerLoop::EnsureOwnerThread(std::string* error_msg) const {
     *error_msg = "worker loop accessed from non-owner thread";
   }
   return false;
+}
+
+bool WorkerLoop::DrainPendingConnections(std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
+  std::deque<PendingConnection> local;
+  {
+    // 减少锁占用：先批量 swap 到本地队列，再逐个接管。
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    local.swap(pending_connections_);
+  }
+
+  while (!local.empty()) {
+    PendingConnection pending = std::move(local.front());
+    local.pop_front();
+
+    if (!AddConnectionOnOwnerThread(std::move(pending.fd), pending.peer_desc,
+                                    error_msg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool WorkerLoop::DrainWakeFd(std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
+  while (true) {
+    std::uint64_t value = 0;
+    const ssize_t rc = ::read(wake_fd_.Get(), &value, sizeof(value));
+    if (rc == static_cast<ssize_t>(sizeof(value))) {
+      // eventfd 计数器被读出后清零，继续读直到 EAGAIN。
+      continue;
+    }
+    if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return true;
+    }
+    if (rc < 0 && errno == EINTR) {
+      continue;
+    }
+    if (error_msg != nullptr) {
+      *error_msg = std::string("read wake fd failed: ") + std::strerror(errno);
+    }
+    return false;
+  }
+}
+
+void WorkerLoop::CloseAllConnections() {
+  // 先采样 fd 列表，再逐个关闭，避免遍历时修改 map。
+  std::vector<int> fds;
+  fds.reserve(connections_.size());
+  for (const auto& [fd, _] : connections_) {
+    (void)_;
+    fds.push_back(fd);
+  }
+
+  for (int fd : fds) {
+    (void)CloseConnection(fd, "worker stopping");
+  }
+}
+
+void WorkerLoop::Wakeup() {
+  if (!wake_fd_) {
+    return;
+  }
+  const std::uint64_t one = 1;
+  const ssize_t rc = ::write(wake_fd_.Get(), &one, sizeof(one));
+  if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    common::LogWarn(std::string("worker wakeup write failed: ") +
+                    std::strerror(errno));
+  }
+}
+
+void WorkerLoop::Run() {
+  owner_thread_id_ = std::this_thread::get_id();
+
+  std::string error;
+  while (!stop_requested_.load()) {
+    if (!PollOnce(kWorkerPollTimeoutMs, &error)) {
+      common::LogError("worker=" + std::to_string(worker_id_) +
+                       " poll loop failed: " + error);
+      break;
+    }
+  }
+
+  // 停止阶段：先吸收移交队列，避免遗留未接管 fd，再收敛已接管连接。
+  if (DrainWakeFd(&error)) {
+    (void)DrainPendingConnections(&error);
+  }
+  CloseAllConnections();
 }
 
 }  // namespace rpc::server

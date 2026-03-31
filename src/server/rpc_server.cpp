@@ -8,6 +8,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,17 +22,21 @@ namespace {
 
 constexpr int kAcceptPollTimeoutMs = 100;
 
-WorkerLoop& SelectWorker(std::vector<WorkerLoop>& workers,
+WorkerLoop& SelectWorker(
+    std::vector<std::unique_ptr<WorkerLoop>>& workers,
                          std::size_t* next_worker) {
-  WorkerLoop& selected = workers[*next_worker];
+  // 最小分发策略：轮询选择 worker。
+  WorkerLoop& selected = *workers[*next_worker];
   *next_worker = (*next_worker + 1) % workers.size();
   return selected;
 }
 
 }  // namespace
 
-RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry)
-    : port_(port), registry_(registry) {}
+RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry,
+                     std::size_t worker_count)
+    : port_(port), worker_count_(worker_count == 0 ? 1 : worker_count),
+      registry_(registry) {}
 
 bool RpcServer::Start() {
   common::UniqueFd listen_fd(::socket(AF_INET, SOCK_STREAM, 0));
@@ -89,18 +94,48 @@ bool RpcServer::Start() {
     return false;
   }
 
-  // 当前仅运行一个 worker，但通过容器形式保留未来扩展点。
-  std::vector<WorkerLoop> workers;
-  workers.emplace_back(0U, registry_);
+  std::vector<std::unique_ptr<WorkerLoop>> workers;
+  workers.reserve(worker_count_);
 
-  std::string worker_error;
-  if (!workers[0].Init(&worker_error)) {
-    common::LogError("worker init failed: " + worker_error);
-    return false;
+  // 启动多个 WorkerLoop，每个 WorkerLoop 绑定独立线程运行。
+  for (std::size_t i = 0; i < worker_count_; ++i) {
+    auto worker = std::make_unique<WorkerLoop>(i, registry_);
+    std::string worker_error;
+    if (!worker->Init(&worker_error)) {
+      common::LogError("worker init failed: " + worker_error);
+      for (auto& started_worker : workers) {
+        started_worker->RequestStop();
+      }
+      for (auto& started_worker : workers) {
+        started_worker->Join();
+      }
+      return false;
+    }
+    if (!worker->Start(&worker_error)) {
+      common::LogError("worker start failed: " + worker_error);
+      for (auto& started_worker : workers) {
+        started_worker->RequestStop();
+      }
+      for (auto& started_worker : workers) {
+        started_worker->Join();
+      }
+      return false;
+    }
+    workers.push_back(std::move(worker));
   }
 
+  auto stop_workers = [&workers]() {
+    // 两阶段停止：先发 stop 信号，再 join，避免线程悬挂。
+    for (auto& worker : workers) {
+      worker->RequestStop();
+    }
+    for (auto& worker : workers) {
+      worker->Join();
+    }
+  };
+
   common::LogInfo("RPC server listening on port " + std::to_string(port_) +
-                  ", workers=1");
+                  ", workers=" + std::to_string(worker_count_));
 
   epoll_event events[16] = {};
   std::size_t next_worker = 0;
@@ -112,6 +147,7 @@ bool RpcServer::Start() {
       if (errno != EINTR) {
         common::LogError(std::string("accept epoll_wait failed: ") +
                          std::strerror(errno));
+        stop_workers();
         return false;
       }
     }
@@ -148,20 +184,13 @@ bool RpcServer::Start() {
           WorkerLoop& worker = SelectWorker(workers, &next_worker);
 
           std::string add_error;
-          if (!worker.AddConnection(common::UniqueFd(client_raw_fd), peer,
-                                    &add_error)) {
+          // acceptor 线程只投递连接，真实接管在 worker 线程完成。
+          if (!worker.EnqueueConnection(common::UniqueFd(client_raw_fd), peer,
+                                        &add_error)) {
             common::LogError("worker add connection failed: " + add_error);
             ::close(client_raw_fd);
           }
         }
-      }
-    }
-
-    for (auto& worker : workers) {
-      std::string poll_error;
-      if (!worker.PollOnce(0, &poll_error)) {
-        common::LogError("worker poll failed: " + poll_error);
-        return false;
       }
     }
   }

@@ -71,6 +71,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>  // std::uint16_t
 
 #include "common/unique_fd.h"         // RAII 文件描述符封装
@@ -80,12 +81,12 @@ namespace rpc::server {
 
 /**
  * @class RpcServer
- * @brief 单线程 epoll RPC 服务端
+ * @brief Acceptor + 多 WorkerLoop RPC 服务端
  *
  * RpcServer 负责：
  * - 监听指定端口的客户端连接
  * - accept 新连接
- * - 将连接分发给 WorkerLoop（当前单 worker）
+ * - 将连接分发给 WorkerLoop（round-robin）
  *
  * ## 核心职责
  *
@@ -103,9 +104,9 @@ namespace rpc::server {
  *
  * ## 线程模型
  *
- * 当前实现仍为单线程运行：
- * - acceptor 与单 worker 在同一线程调度
- * - 结构上已可平滑扩展到 one-loop-per-thread
+ * 当前实现为 one-loop-per-thread：
+ * - acceptor 线程负责 listen/accept/分发
+ * - 每个 WorkerLoop 在独立线程中驱动所属连接
  *
  * @note 服务端目前不支持优雅关闭，调用 Start() 后将无限循环
  */
@@ -129,7 +130,8 @@ class RpcServer {
    *   RpcServer server(8080, registry);  // 在 8080 端口监听
    * @endcode
    */
-  RpcServer(std::uint16_t port, const ServiceRegistry& registry);
+  RpcServer(std::uint16_t port, const ServiceRegistry& registry,
+            std::size_t worker_count = 2U);
 
   /**
    * @brief 启动服务端事件循环
@@ -196,6 +198,8 @@ class RpcServer {
    * 有效范围：1-65535，建议使用 1024 以上的端口。
    */
   std::uint16_t port_;
+
+  std::size_t worker_count_;
 
   /**
    * @brief 服务注册表引用

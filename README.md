@@ -16,7 +16,8 @@
 - `Connection` 明确归属单一 `WorkerLoop`，并约束只在 owner worker 线程访问
 - 已进一步演进为“连接级 coroutine 主路径”：`HandleConnectionCo` 驱动读请求/执行业务/写响应
 - epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
-- 当前只运行单 worker loop，但结构已为 one-loop-per-thread / 多 reactor 做准备
+- 当前服务端已升级为多 WorkerLoop / one-loop-per-thread（最小可用版）
+- RpcServer 通过 round-robin 分发新连接，worker 通过 eventfd + 队列在所属线程接管连接
 - 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
@@ -31,7 +32,7 @@
 框架能力（当前版本）：
 - 通用 RPC 请求/响应消息（`RpcRequest` / `RpcResponse`）
 - 自定义协议：`[4字节长度][protobuf数据]`
-- 服务端单线程 epoll 事件循环（listen fd + 多连接 fd）
+- 服务端 Acceptor + 多 WorkerLoop（one-loop-per-thread）
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
 - 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
@@ -80,16 +81,18 @@
 
 - `src/server/rpc_server.*`
   - Acceptor 角色：listen socket 初始化、accept 新连接
-  - 将新连接分发给 WorkerLoop（当前固定单 worker）
-  - 当前运行模型：acceptor 与唯一 worker 在同一线程调度
+  - 按 round-robin 将新连接分发给多个 WorkerLoop
+  - 只负责接入和分发，不直接驱动连接协程
 
 - `src/server/worker_loop.*`
-  - 持有 worker 专属 epoll fd 与 connection map
-  - 注册/移除 client fd
+  - 每个 worker 运行在独立线程（one-loop-per-thread）
+  - 持有 worker 专属 epoll fd、wake fd（eventfd）与 connection map
+  - 通过线程安全 pending 队列接收 acceptor 投递的新连接
+  - 在 worker 线程中注册/移除 client fd（保证线程亲和）
   - 驱动连接可读/可写事件与连接协程主路径
   - 执行连接 timeout tick 与关闭收敛
   - 明确线程亲和：worker loop 只允许 owner 线程调用
-  - 当前单线程运行，但接口为未来多 worker 预留
+  - 提供最小启动/停止能力，便于测试和后续扩展
 
 - `src/server/connection.*`
   - 连接级状态对象：`fd + read_buffer + write_buffer`
@@ -108,18 +111,18 @@
 
 ## 服务端演进说明（当前阶段）
 
-当前版本的服务端不是多线程 reactor，也不是 io_uring 版本。
+当前版本是最小可用多线程协程服务端（one-loop-per-thread），但仍不是 io_uring / 线程池 / 完整生产级框架。
 
 本次抽象的价值：
-- 先固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
-- 先固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
-- 保持单 worker 运行，便于学习、调试和验证 coroutine 主路径
+- 固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
+- 固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
+- 在最小改动下落地 one-loop-per-thread，继续复用现有 coroutine 主路径
 
-下一步扩展到 one-loop-per-thread / 多 reactor 时，只需要：
-1. 创建多个 `WorkerLoop`（每个 worker 绑定一个线程）
-2. 将 `RpcServer` 的分发策略从固定单 worker 扩展为轮询或哈希分发
-3. 在 accept 线程与 worker 线程之间引入连接移交通道（如 eventfd + queue）
-4. 保持 `Connection` 不跨线程访问，继续复用现有协程读写主路径
+后续如果继续演进，可沿这些方向推进：
+1. 从 round-robin 演进到更强分发策略（负载、连接数、CPU 亲和）
+2. 增加更细粒度取消与调度语义（per-request cancellation）
+3. 继续完善 worker 停止与优雅收敛能力
+4. 评估 io_uring 作为下一代 I/O readiness/提交模型
 
 - `src/client/rpc_client.*`
   - 连接服务端
@@ -409,6 +412,12 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - WorkerLoop 驱动连接请求处理并返回响应
   - 对端关闭后连接由 WorkerLoop 收敛清理
 
+- `server_multi_worker_loop_test`：多 worker 线程化验证
+  - worker 独立线程运行（Start/RequestStop/Join）
+  - acceptor 线程风格的跨线程连接投递与 worker 接管
+  - round-robin 风格分配下，多 worker 都能正确处理请求
+  - worker 停止时连接收敛关闭
+
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
   - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
@@ -466,7 +475,7 @@ cd rpc_project/build
 - 当前是“连接级 coroutine 主路径 + 单线程 epoll”阶段，不是完整 coroutine runtime
 - 不引入多线程 reactor / io_uring，继续以单线程 epoll 作为 I/O readiness 基座
 - 后续可继续增加连接协程的 deadline、取消、背压策略与更细粒度状态机
-- 架构扩展路径：在保持 Connection 线程亲和前提下，将单 worker 扩展为多个 WorkerLoop（one-loop-per-thread）
+- 架构扩展路径：在当前 one-loop-per-thread 基础上，继续加强分发、取消与执行模型
 
 coroutine API 的后续演进方向：
 - 进一步减少 bridge 残余路径与对象复制开销

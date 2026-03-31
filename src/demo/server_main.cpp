@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -43,8 +44,10 @@ int main() {
   }
 
   constexpr std::uint16_t kPort = 50051;
+  // 最小 one-loop-per-thread 演示：默认启动 2 个 worker 线程。
+  constexpr std::size_t kWorkerCount = 2;
   // 3) 启动 RPC 服务端循环。
-  rpc::server::RpcServer server(kPort, registry);
+  rpc::server::RpcServer server(kPort, registry, kWorkerCount);
   if (!server.Start()) {
     rpc::common::LogError("server start failed");
     return 1;
