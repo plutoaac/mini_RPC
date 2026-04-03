@@ -8,9 +8,7 @@
 
 #include <cerrno>
 #include <cstring>
-#include <memory>
 #include <string>
-#include <vector>
 
 #include "common/log.h"
 #include "common/unique_fd.h"
@@ -22,15 +20,6 @@ namespace {
 
 constexpr int kAcceptPollTimeoutMs = 100;
 
-WorkerLoop& SelectWorker(
-    std::vector<std::unique_ptr<WorkerLoop>>& workers,
-                         std::size_t* next_worker) {
-  // 最小分发策略：轮询选择 worker。
-  WorkerLoop& selected = *workers[*next_worker];
-  *next_worker = (*next_worker + 1) % workers.size();
-  return selected;
-}
-
 }  // namespace
 
 RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry,
@@ -38,26 +27,35 @@ RpcServer::RpcServer(std::uint16_t port, const ServiceRegistry& registry,
     : port_(port), worker_count_(worker_count == 0 ? 1 : worker_count),
       registry_(registry) {}
 
-bool RpcServer::Start() {
-  common::UniqueFd listen_fd(::socket(AF_INET, SOCK_STREAM, 0));
-  if (!listen_fd) {
-    common::LogError(std::string("socket failed: ") + std::strerror(errno));
+RpcServer::~RpcServer() { (void)Stop(); }
+
+bool RpcServer::InitAcceptor(std::string* error_msg) {
+  listen_fd_ = common::UniqueFd(::socket(AF_INET, SOCK_STREAM, 0));
+  if (!listen_fd_) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("socket failed: ") + std::strerror(errno);
+    }
     return false;
   }
 
   int reuse = 1;
-  if (::setsockopt(listen_fd.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse,
+  if (::setsockopt(listen_fd_.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse,
                    sizeof(reuse)) < 0) {
-    common::LogError(std::string("setsockopt(SO_REUSEADDR) failed: ") +
-                     std::strerror(errno));
+    if (error_msg != nullptr) {
+      *error_msg = std::string("setsockopt(SO_REUSEADDR) failed: ") +
+                   std::strerror(errno);
+    }
     return false;
   }
 
-  const int listen_flags = ::fcntl(listen_fd.Get(), F_GETFL, 0);
+  const int listen_flags = ::fcntl(listen_fd_.Get(), F_GETFL, 0);
   if (listen_flags < 0 ||
-      ::fcntl(listen_fd.Get(), F_SETFL, listen_flags | O_NONBLOCK) < 0) {
-    common::LogError(std::string("fcntl(O_NONBLOCK) failed for listen fd: ") +
-                     std::strerror(errno));
+      ::fcntl(listen_fd_.Get(), F_SETFL, listen_flags | O_NONBLOCK) < 0) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          std::string("fcntl(O_NONBLOCK) failed for listen fd: ") +
+          std::strerror(errno);
+    }
     return false;
   }
 
@@ -66,103 +64,168 @@ bool RpcServer::Start() {
   addr.sin_port = htons(port_);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  if (::bind(listen_fd.Get(), reinterpret_cast<sockaddr*>(&addr),
+  if (::bind(listen_fd_.Get(), reinterpret_cast<sockaddr*>(&addr),
              sizeof(addr)) < 0) {
-    common::LogError(std::string("bind failed: ") + std::strerror(errno));
+    if (error_msg != nullptr) {
+      *error_msg = std::string("bind failed: ") + std::strerror(errno);
+    }
     return false;
   }
 
-  if (::listen(listen_fd.Get(), 128) < 0) {
-    common::LogError(std::string("listen failed: ") + std::strerror(errno));
+  if (::listen(listen_fd_.Get(), 128) < 0) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("listen failed: ") + std::strerror(errno);
+    }
     return false;
   }
 
-  common::UniqueFd accept_epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
-  if (!accept_epoll_fd) {
-    common::LogError(std::string("epoll_create1 failed: ") +
-                     std::strerror(errno));
+  accept_epoll_fd_ = common::UniqueFd(::epoll_create1(EPOLL_CLOEXEC));
+  if (!accept_epoll_fd_) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("epoll_create1 failed: ") +
+                   std::strerror(errno);
+    }
     return false;
   }
 
   epoll_event listen_ev{};
   listen_ev.events = EPOLLIN;
-  listen_ev.data.fd = listen_fd.Get();
-  if (::epoll_ctl(accept_epoll_fd.Get(), EPOLL_CTL_ADD, listen_fd.Get(),
+  listen_ev.data.fd = listen_fd_.Get();
+  if (::epoll_ctl(accept_epoll_fd_.Get(), EPOLL_CTL_ADD, listen_fd_.Get(),
                   &listen_ev) < 0) {
-    common::LogError(std::string("epoll_ctl add listen fd failed: ") +
-                     std::strerror(errno));
+    if (error_msg != nullptr) {
+      *error_msg = std::string("epoll_ctl add listen fd failed: ") +
+                   std::strerror(errno);
+    }
     return false;
   }
 
-  std::vector<std::unique_ptr<WorkerLoop>> workers;
-  workers.reserve(worker_count_);
+  return true;
+}
 
-  // 启动多个 WorkerLoop，每个 WorkerLoop 绑定独立线程运行。
+bool RpcServer::StartWorkers(std::string* error_msg) {
+  // 重新启动时先清空旧 worker，保证成员资源语义一致。
+  workers_.clear();
+  workers_.reserve(worker_count_);
+
   for (std::size_t i = 0; i < worker_count_; ++i) {
     auto worker = std::make_unique<WorkerLoop>(i, registry_);
-    std::string worker_error;
-    if (!worker->Init(&worker_error)) {
-      common::LogError("worker init failed: " + worker_error);
-      for (auto& started_worker : workers) {
-        started_worker->RequestStop();
-      }
-      for (auto& started_worker : workers) {
-        started_worker->Join();
-      }
+    // Init 负责 fd/epoll 基础资源；Start 才真正拉起线程。
+    if (!worker->Init(error_msg)) {
       return false;
     }
-    if (!worker->Start(&worker_error)) {
-      common::LogError("worker start failed: " + worker_error);
-      for (auto& started_worker : workers) {
-        started_worker->RequestStop();
-      }
-      for (auto& started_worker : workers) {
-        started_worker->Join();
-      }
+    if (!worker->Start(error_msg)) {
       return false;
     }
-    workers.push_back(std::move(worker));
+    workers_.push_back(std::move(worker));
+  }
+  return true;
+}
+
+void RpcServer::StopWorkers() {
+  // 第一阶段：并行广播停止请求，尽快阻止继续接管连接。
+  for (auto& worker : workers_) {
+    worker->RequestStop();
+  }
+  // 第二阶段：等待所有 worker 线程退出，形成确定性收敛点。
+  for (auto& worker : workers_) {
+    worker->Join();
+  }
+  workers_.clear();
+}
+
+void RpcServer::CloseAcceptor() {
+  accept_epoll_fd_.Reset();
+  listen_fd_.Reset();
+}
+
+WorkerLoop& RpcServer::SelectWorker() {
+  // 轮询分发：简单、无锁、可预测，且与 one-loop-per-thread 模型对齐。
+  // 这里由 acceptor 线程单线程访问，不需要额外同步。
+  WorkerLoop& selected = *workers_[next_worker_];
+  next_worker_ = (next_worker_ + 1) % workers_.size();
+  return selected;
+}
+
+bool RpcServer::Start() {
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    if (running_) {
+      common::LogWarn("RpcServer::Start called while server is already running");
+      return false;
+    }
+    running_ = true;
   }
 
-  auto stop_workers = [&workers]() {
-    // 两阶段停止：先发 stop 信号，再 join，避免线程悬挂。
-    for (auto& worker : workers) {
-      worker->RequestStop();
-    }
-    for (auto& worker : workers) {
-      worker->Join();
-    }
-  };
+  // 发布运行态。Stop() 会通过这两个原子量触发退出路径。
+  stop_requested_.store(false);
+  accepting_new_connections_.store(true);
+  next_worker_ = 0;
+
+  // 阶段 1：建立 acceptor 资源（listen fd + epoll）。
+  std::string init_error;
+  if (!InitAcceptor(&init_error)) {
+    common::LogError(init_error);
+    CloseAcceptor();
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    running_ = false;
+    lifecycle_cv_.notify_all();
+    return false;
+  }
+
+  // 阶段 2：拉起 worker 线程池（每 worker 一个 event loop 线程）。
+  if (!StartWorkers(&init_error)) {
+    common::LogError("worker init/start failed: " + init_error);
+    StopWorkers();
+    CloseAcceptor();
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    running_ = false;
+    lifecycle_cv_.notify_all();
+    return false;
+  }
 
   common::LogInfo("RPC server listening on port " + std::to_string(port_) +
                   ", workers=" + std::to_string(worker_count_));
 
   epoll_event events[16] = {};
-  std::size_t next_worker = 0;
+  bool fatal_error = false;
 
-  while (true) {
+  // 阶段 3：accept 主循环。职责仅限“接入 + 分发”，不直接处理连接 I/O。
+  while (!stop_requested_.load()) {
     const int ready =
-        ::epoll_wait(accept_epoll_fd.Get(), events, 16, kAcceptPollTimeoutMs);
+        ::epoll_wait(accept_epoll_fd_.Get(), events, 16, kAcceptPollTimeoutMs);
     if (ready < 0) {
-      if (errno != EINTR) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (!stop_requested_.load()) {
         common::LogError(std::string("accept epoll_wait failed: ") +
                          std::strerror(errno));
-        stop_workers();
-        return false;
+        fatal_error = true;
       }
+      break;
+    }
+
+    if (stop_requested_.load() || !accepting_new_connections_.load()) {
+      continue;
     }
 
     if (ready > 0) {
       for (int i = 0; i < ready; ++i) {
-        if (events[i].data.fd != listen_fd.Get()) {
+        if (events[i].data.fd != listen_fd_.Get()) {
           continue;
         }
 
+        // ET-like drain 习惯：一次 wake 后尽量 accept 到 EAGAIN，减少下次唤醒开销。
         while (true) {
+          if (!accepting_new_connections_.load()) {
+            break;
+          }
+
           sockaddr_in client_addr{};
           socklen_t client_addr_len = sizeof(client_addr);
           const int client_raw_fd = ::accept4(
-              listen_fd.Get(), reinterpret_cast<sockaddr*>(&client_addr),
+              listen_fd_.Get(), reinterpret_cast<sockaddr*>(&client_addr),
               &client_addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
           if (client_raw_fd < 0) {
             if (errno == EINTR) {
@@ -181,10 +244,10 @@ bool RpcServer::Start() {
           const std::string peer = std::string(ip) + ':' +
                                    std::to_string(ntohs(client_addr.sin_port));
 
-          WorkerLoop& worker = SelectWorker(workers, &next_worker);
+          WorkerLoop& worker = SelectWorker();
 
           std::string add_error;
-          // acceptor 线程只投递连接，真实接管在 worker 线程完成。
+          // acceptor 线程只投递连接，真实接管(注册 epoll/启动协程)在 worker 线程完成。
           if (!worker.EnqueueConnection(common::UniqueFd(client_raw_fd), peer,
                                         &add_error)) {
             common::LogError("worker add connection failed: " + add_error);
@@ -194,6 +257,44 @@ bool RpcServer::Start() {
       }
     }
   }
+
+  // 统一停机收敛：停止接入、回收 acceptor fd、停止并回收所有 worker。
+  accepting_new_connections_.store(false);
+  stop_requested_.store(true);
+  CloseAcceptor();
+  StopWorkers();
+
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    running_ = false;
+  }
+  lifecycle_cv_.notify_all();
+
+  return !fatal_error;
+}
+
+bool RpcServer::Stop() {
+  {
+    std::unique_lock<std::mutex> lock(lifecycle_mu_);
+    if (!running_) {
+      // 允许幂等 Stop，保证调用方无需关心当前状态。
+      // 这里顺手执行一次兜底回收，覆盖 "Start 从未成功" 等边界场景。
+      stop_requested_.store(true);
+      accepting_new_connections_.store(false);
+      StopWorkers();
+      CloseAcceptor();
+      return true;
+    }
+  }
+
+  // 先发布停止请求并停止接入，实际资源回收由 Start 线程统一完成。
+  accepting_new_connections_.store(false);
+  stop_requested_.store(true);
+
+  std::unique_lock<std::mutex> lock(lifecycle_mu_);
+  // 等待 Start 完成统一清理并把 running_ 置回 false。
+  lifecycle_cv_.wait(lock, [this]() { return !running_; });
+  return true;
 }
 
 }  // namespace rpc::server

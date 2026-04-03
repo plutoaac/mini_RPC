@@ -47,6 +47,7 @@ class WorkerLoop {
   [[nodiscard]] std::size_t ConnectionCount() const noexcept;
   // 总接管连接数（单调递增），用于结构性验证分发是否生效。
   [[nodiscard]] std::size_t TotalAcceptedCount() const noexcept;
+  [[nodiscard]] bool IsAcceptingNewConnections() const noexcept;
   [[nodiscard]] bool IsOnOwnerThread() const noexcept;
 
  private:
@@ -70,6 +71,8 @@ class WorkerLoop {
   bool AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
                                   std::string_view peer_desc,
                                   std::string* error_msg);
+  // 连接进入 map 后，再显式启动主协程，避免时序歧义。
+  void StartConnectionCoroutine(ConnectionState* state);
   // Drain 流程：先 drain wake fd，再 drain pending queue。
   bool DrainPendingConnections(std::string* error_msg);
   bool DrainWakeFd(std::string* error_msg);
@@ -95,6 +98,7 @@ class WorkerLoop {
   std::deque<PendingConnection> pending_connections_;
 
   std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> accepting_new_connections_{false};
   std::atomic<std::size_t> connection_count_{0};
   std::atomic<std::size_t> total_accepted_count_{0};
 

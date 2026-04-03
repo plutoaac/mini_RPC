@@ -83,6 +83,14 @@ void WaitForNoConnection(rpc::server::WorkerLoop* worker) {
   assert(worker->ConnectionCount() == 0U);
 }
 
+void WaitForConnectionCount(rpc::server::WorkerLoop* worker,
+                            std::size_t expected) {
+  for (int i = 0; i < 200 && worker->ConnectionCount() != expected; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  assert(worker->ConnectionCount() == expected);
+}
+
 void TestWorkerLoopThreadedHandoffAndStop() {
   rpc::server::ServiceRegistry registry;
   assert(registry.Register("EchoService", "Ping", [](std::string_view req) {
@@ -94,6 +102,7 @@ void TestWorkerLoopThreadedHandoffAndStop() {
   assert(worker.Init(&error));
   // worker 在独立线程运行，模拟真实服务端运行模式。
   assert(worker.Start(&error));
+  assert(worker.IsAcceptingNewConnections());
 
   int fds[2] = {-1, -1};
   assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -105,6 +114,8 @@ void TestWorkerLoopThreadedHandoffAndStop() {
   // 通过队列跨线程投递连接，由 worker 线程完成接管。
   assert(worker.EnqueueConnection(std::move(server_fd), "threaded-handoff",
                                   &error));
+  // 等价生命周期约束：先确认连接已纳入 worker 管理，再发送请求。
+  WaitForConnectionCount(&worker, 1U);
 
   rpc::RpcRequest req = MakeRequest("mw-1", "hello-thread");
   std::string frame;
@@ -126,6 +137,7 @@ void TestWorkerLoopThreadedHandoffAndStop() {
   assert(worker.TotalAcceptedCount() == 1U);
 
   worker.RequestStop();
+  assert(!worker.IsAcceptingNewConnections());
   worker.Join();
 }
 
@@ -143,6 +155,8 @@ void TestRoundRobinReadyStructure() {
   assert(worker1.Init(&error));
   assert(worker0.Start(&error));
   assert(worker1.Start(&error));
+  assert(worker0.IsAcceptingNewConnections());
+  assert(worker1.IsAcceptingNewConnections());
 
   constexpr int kConnections = 6;
   std::vector<rpc::common::UniqueFd> client_fds;
@@ -161,6 +175,9 @@ void TestRoundRobinReadyStructure() {
     assert(
         target->EnqueueConnection(std::move(server_fd), "rr-handoff", &error));
   }
+
+  WaitForConnectionCount(&worker0, 3U);
+  WaitForConnectionCount(&worker1, 3U);
 
   for (int i = 0; i < kConnections; ++i) {
     rpc::RpcRequest req =
@@ -191,6 +208,8 @@ void TestRoundRobinReadyStructure() {
 
   worker0.RequestStop();
   worker1.RequestStop();
+  assert(!worker0.IsAcceptingNewConnections());
+  assert(!worker1.IsAcceptingNewConnections());
   worker0.Join();
   worker1.Join();
 }

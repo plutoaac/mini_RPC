@@ -195,6 +195,7 @@ bool WorkerLoop::Init(std::string* error_msg) {
 
   owner_thread_id_ = std::this_thread::get_id();
   stop_requested_.store(false);
+  accepting_new_connections_.store(true);
   return true;
 }
 
@@ -213,12 +214,15 @@ bool WorkerLoop::Start(std::string* error_msg) {
   }
 
   stop_requested_.store(false);
+  accepting_new_connections_.store(true);
   // one-loop-per-thread：每个 WorkerLoop 在独立线程运行 Run()。
   thread_ = std::thread([this]() { Run(); });
   return true;
 }
 
 void WorkerLoop::RequestStop() {
+  // 先停止接收新连接，再请求线程退出，避免退出阶段继续积压 pending 队列。
+  accepting_new_connections_.store(false);
   stop_requested_.store(true);
   Wakeup();
 }
@@ -235,6 +239,13 @@ bool WorkerLoop::EnqueueConnection(rpc::common::UniqueFd fd,
   if (!fd) {
     if (error_msg != nullptr) {
       *error_msg = "invalid client fd";
+    }
+    return false;
+  }
+
+  if (!accepting_new_connections_.load()) {
+    if (error_msg != nullptr) {
+      *error_msg = "worker loop is stopping and no longer accepts new connections";
     }
     return false;
   }
@@ -301,15 +312,10 @@ bool WorkerLoop::AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
     return false;
   }
 
-  // 步骤2：创建 ConnectionState 并启动协程
-  // - Connection 封装了 socket I/O 和协议处理
-  // - Task 存储协程的执行状态
+  // 步骤2：创建 ConnectionState，但先不启动协程。
+  // 先放入 map，再启动协程，确保生命周期归属清晰。
   auto state = std::make_unique<ConnectionState>(std::move(fd), registry_);
   state->connection.BindToWorkerLoop(worker_id_);
-
-  // 启动协程：协程开始执行，遇到第一个 co_await 时挂起
-  state->task.emplace(HandleConnectionCo(
-      &state->connection, &state->coroutine_ok, &state->coroutine_error));
 
   // 步骤3：将连接状态存入 map
   const auto [it, inserted] = connections_.emplace(raw_fd, std::move(state));
@@ -322,6 +328,9 @@ bool WorkerLoop::AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
     return false;
   }
 
+  // 步骤4：连接已纳入 worker 管理，再显式启动主协程。
+  StartConnectionCoroutine(it->second.get());
+
   connection_count_.store(connections_.size());
   total_accepted_count_.fetch_add(1);
 
@@ -329,6 +338,15 @@ bool WorkerLoop::AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
                   " adopted connection " + std::string(peer_desc) +
                   " fd=" + std::to_string(raw_fd));
   return true;
+}
+
+void WorkerLoop::StartConnectionCoroutine(ConnectionState* state) {
+  if (state == nullptr) {
+    return;
+  }
+  // 协程开始执行，通常会在第一个 co_await 处挂起。
+  state->task.emplace(HandleConnectionCo(
+      &state->connection, &state->coroutine_ok, &state->coroutine_error));
 }
 
 // ============================================================================
@@ -495,6 +513,10 @@ std::size_t WorkerLoop::TotalAcceptedCount() const noexcept {
   return total_accepted_count_.load();
 }
 
+bool WorkerLoop::IsAcceptingNewConnections() const noexcept {
+  return accepting_new_connections_.load();
+}
+
 bool WorkerLoop::IsOnOwnerThread() const noexcept {
   if (owner_thread_id_ == std::thread::id{}) {
     return true;
@@ -632,6 +654,7 @@ void WorkerLoop::Run() {
   owner_thread_id_ = std::this_thread::get_id();
 
   std::string error;
+  // 运行阶段：持续处理 I/O、timeout 与 wakeup 事件。
   while (!stop_requested_.load()) {
     if (!PollOnce(kWorkerPollTimeoutMs, &error)) {
       common::LogError("worker=" + std::to_string(worker_id_) +
@@ -641,6 +664,7 @@ void WorkerLoop::Run() {
   }
 
   // 停止阶段：先吸收移交队列，避免遗留未接管 fd，再收敛已接管连接。
+  accepting_new_connections_.store(false);
   if (DrainWakeFd(&error)) {
     (void)DrainPendingConnections(&error);
   }

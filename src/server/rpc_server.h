@@ -35,7 +35,7 @@
  * 2. **接入分发阶段**
  *    - 等待 listen fd 就绪
  *    - accept 新连接
- *    - 分发给某个 WorkerLoop（当前固定单 worker）
+ *    - 按 round-robin 分发给某个 WorkerLoop
  *
  * 3. **Worker 驱动阶段**
  *    - WorkerLoop 负责连接 epoll 驱动、协程推进和连接生命周期
@@ -58,7 +58,7 @@
  * ## 设计特点
  *
  * - **结构先行**：Acceptor 与 WorkerLoop 职责分离
- * - **单 worker 运行**：当前仅创建一个 WorkerLoop
+ * - **多 worker 运行**：one-loop-per-thread，可配置 worker 数量
  * - **非阻塞 I/O**：所有 socket 均为非阻塞模式
  * - **RAII 资源管理**：使用 UniqueFd 自动管理文件描述符
  * - **优雅关闭**：连接关闭时自动清理 epoll 注册
@@ -71,13 +71,20 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>  // std::uint16_t
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "common/unique_fd.h"         // RAII 文件描述符封装
 #include "server/service_registry.h"  // 服务注册表
 
 namespace rpc::server {
+
+class WorkerLoop;
 
 /**
  * @class RpcServer
@@ -108,7 +115,7 @@ namespace rpc::server {
  * - acceptor 线程负责 listen/accept/分发
  * - 每个 WorkerLoop 在独立线程中驱动所属连接
  *
- * @note 服务端目前不支持优雅关闭，调用 Start() 后将无限循环
+ * @note 支持最小可用 Stop()，用于工程化测试与资源收敛
  */
 class RpcServer {
  public:
@@ -133,6 +140,8 @@ class RpcServer {
   RpcServer(std::uint16_t port, const ServiceRegistry& registry,
             std::size_t worker_count = 2U);
 
+  ~RpcServer();
+
   /**
    * @brief 启动服务端事件循环
    *
@@ -146,18 +155,17 @@ class RpcServer {
    * 4. 绑定端口
    * 5. 开始监听（backlog=128）
    * 6. 创建 epoll 实例
-   * 7. 注册监听 socket 到 epoll
-   *
-   * ## 事件循环
-   *
-   * 进入无限循环处理事件：
-   * - 新连接：accept4 创建客户端 socket，注册到 epoll
-   * - 读事件：调用 Connection::OnReadable()
-   * - 写事件：调用 Connection::OnWritable()
-   * - 错误/关闭：清理连接资源
-   *
-   * @return true 不应该到达（无限循环）
-   * @return false 初始化失败或运行时致命错误
+    * 7. 注册监听 socket 到 epoll
+    *
+    * ## 事件循环
+    *
+    * 进入事件循环处理接入与分发：
+    * - 新连接：accept4 创建客户端 socket
+    * - 分发：投递给 WorkerLoop，由 worker 线程接管连接生命周期
+    * - 停机：收到 Stop() 请求后退出循环并统一收敛资源
+    *
+    * @return true 正常停机退出（通常由 Stop() 触发）
+    * @return false 初始化失败或运行时致命错误
    *
    * ## 错误处理
    *
@@ -171,8 +179,8 @@ class RpcServer {
    * - epoll_ctl() 注册失败
    * - epoll_wait() 返回错误（非 EINTR）
    *
-   * @note 此方法会阻塞当前线程，直到发生致命错误
-   * @note 目前没有提供优雅关闭的机制
+    * @note 此方法会阻塞当前线程，直到 Stop() 或发生致命错误
+    * @note Stop() 是最小可用停机接口：触发停止接入并等待 Start() 收敛完成
    *
    * ## 示例
    *
@@ -186,6 +194,18 @@ class RpcServer {
    * @endcode
    */
   bool Start();
+
+  // 触发最小可用停机：停止 accept、通知 worker 停止并等待收敛完成。
+  // 该接口是幂等的，适合测试和析构场景重复调用。
+  bool Stop();
+
+ private:
+  bool InitAcceptor(std::string* error_msg);
+  bool StartWorkers(std::string* error_msg);
+  void StopWorkers();
+  void CloseAcceptor();
+
+  WorkerLoop& SelectWorker();
 
   // ===========================================================================
   // 成员变量
@@ -209,6 +229,18 @@ class RpcServer {
    * @warning 调用者必须确保 registry 在 RpcServer 整个生命周期内有效
    */
   const ServiceRegistry& registry_;
+
+  common::UniqueFd listen_fd_;
+  common::UniqueFd accept_epoll_fd_;
+  std::vector<std::unique_ptr<WorkerLoop>> workers_;
+  std::size_t next_worker_{0};
+
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> accepting_new_connections_{false};
+
+  std::mutex lifecycle_mu_;
+  std::condition_variable lifecycle_cv_;
+  bool running_{false};
 };
 
 }  // namespace rpc::server

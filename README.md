@@ -18,6 +18,7 @@
 - epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
 - 当前服务端已升级为多 WorkerLoop / one-loop-per-thread（最小可用版）
 - RpcServer 通过 round-robin 分发新连接，worker 通过 eventfd + 队列在所属线程接管连接
+- RpcServer 已具备最小生命周期控制：Start/Stop 与 worker 收敛回收
 - 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
@@ -83,6 +84,8 @@
   - Acceptor 角色：listen socket 初始化、accept 新连接
   - 按 round-robin 将新连接分发给多个 WorkerLoop
   - 只负责接入和分发，不直接驱动连接协程
+  - 持有 listen fd / accept epoll / workers 成员，统一管理生命周期
+  - 提供最小 `Stop()`：停止接入、通知 worker 停止、等待 worker join
 
 - `src/server/worker_loop.*`
   - 每个 worker 运行在独立线程（one-loop-per-thread）
@@ -91,6 +94,7 @@
   - 在 worker 线程中注册/移除 client fd（保证线程亲和）
   - 驱动连接可读/可写事件与连接协程主路径
   - 执行连接 timeout tick 与关闭收敛
+  - 停止路径分阶段：stop requested -> 不再接收新连接 -> drain pending -> 收敛现有连接
   - 明确线程亲和：worker loop 只允许 owner 线程调用
   - 提供最小启动/停止能力，便于测试和后续扩展
 
@@ -108,6 +112,7 @@
   - 新增连接级 deadline：读超时、写超时可触发协程收敛退出
   - 新增轻量背压保护：`write_buffer` 超阈值时返回错误并进入收敛路径
   - 明确连接归属：连接绑定 owner worker，非 owner 线程访问属于误用
+  - 连接主协程启动时序更清晰：连接先进入 worker map，再启动协程主路径
 
 ## 服务端演进说明（当前阶段）
 
@@ -117,6 +122,12 @@
 - 固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
 - 固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
 - 在最小改动下落地 one-loop-per-thread，继续复用现有 coroutine 主路径
+- 增强工程可控性：具备可测试的 Start/Stop 生命周期与清晰收敛语义
+
+为什么当前不引入线程池 / io_uring：
+- 线程池会把 I/O 驱动与业务执行模型耦合复杂化，不利于当前阶段教学与调试
+- io_uring 会显著扩大系统复杂度和故障面，不适合这一步的小步演进目标
+- 当前优先把线程边界、协程收敛、生命周期一致性打磨扎实
 
 后续如果继续演进，可沿这些方向推进：
 1. 从 round-robin 演进到更强分发策略（负载、连接数、CPU 亲和）
@@ -417,6 +428,12 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - acceptor 线程风格的跨线程连接投递与 worker 接管
   - round-robin 风格分配下，多 worker 都能正确处理请求
   - worker 停止时连接收敛关闭
+
+- `rpc_server_lifecycle_test`：服务端生命周期验证
+  - `RpcServer` 可启动并可 `Stop()`
+  - `Stop()` 后不再接收新连接
+  - `Call / CallAsync / CallCo` 在多 worker 服务端下行为正确
+  - 停止后客户端调用可预期失败，避免悬挂
 
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
