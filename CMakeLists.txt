@@ -23,6 +23,7 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
 add_library(rpc_framework
     ${PROTO_SRCS}
     src/protocol/codec.cpp
+    src/common/thread_pool.cpp
     src/server/service_registry.cpp
     src/server/connection.cpp
     src/server/worker_loop.cpp
@@ -311,6 +312,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME rpc_server_lifecycle_test COMMAND rpc_server_lifecycle_test)
+
+    add_executable(server_thread_pool_integration_test
+        tests/server_thread_pool_integration_test.cpp
+    )
+
+    target_link_libraries(server_thread_pool_integration_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME server_thread_pool_integration_test COMMAND server_thread_pool_integration_test)
 endif()
 
 add_executable(rpc_benchmark
@@ -318,6 +331,16 @@ add_executable(rpc_benchmark
 )
 
 target_link_libraries(rpc_benchmark
+    PRIVATE
+        rpc_framework
+        Threads::Threads
+)
+
+add_executable(rpc_thread_pool_benchmark
+    benchmarks/rpc_thread_pool_benchmark.cpp
+)
+
+target_link_libraries(rpc_thread_pool_benchmark
     PRIVATE
         rpc_framework
         Threads::Threads

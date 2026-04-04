@@ -44,11 +44,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/log.h"
+#include "common/rpc_error.h"
+#include "rpc.pb.h"
 
 namespace rpc::server {
 
@@ -153,8 +157,9 @@ rpc::coroutine::Task<void> HandleConnectionCo(Connection* connection,
 // 构造函数和初始化
 // ============================================================================
 
-WorkerLoop::WorkerLoop(std::size_t worker_id, const ServiceRegistry& registry)
-    : worker_id_(worker_id), registry_(registry) {}
+WorkerLoop::WorkerLoop(std::size_t worker_id, const ServiceRegistry& registry,
+                       rpc::common::ThreadPool* thread_pool)
+    : worker_id_(worker_id), registry_(registry), thread_pool_(thread_pool) {}
 
 WorkerLoop::~WorkerLoop() {
   // 即使调用方遗漏停止逻辑，也尽量在析构时安全回收线程。
@@ -194,6 +199,9 @@ bool WorkerLoop::Init(std::string* error_msg) {
   }
 
   owner_thread_id_ = std::this_thread::get_id();
+  completed_queue_ = std::make_shared<CompletedQueue>();
+  completed_queue_->wake_fd = wake_fd_.Get();
+  completed_queue_->accepting.store(true);
   stop_requested_.store(false);
   accepting_new_connections_.store(true);
   return true;
@@ -215,6 +223,10 @@ bool WorkerLoop::Start(std::string* error_msg) {
 
   stop_requested_.store(false);
   accepting_new_connections_.store(true);
+  if (completed_queue_ != nullptr) {
+    completed_queue_->accepting.store(true);
+    completed_queue_->wake_fd = wake_fd_.Get();
+  }
   // one-loop-per-thread：每个 WorkerLoop 在独立线程运行 Run()。
   thread_ = std::thread([this]() { Run(); });
   return true;
@@ -245,7 +257,8 @@ bool WorkerLoop::EnqueueConnection(rpc::common::UniqueFd fd,
 
   if (!accepting_new_connections_.load()) {
     if (error_msg != nullptr) {
-      *error_msg = "worker loop is stopping and no longer accepts new connections";
+      *error_msg =
+          "worker loop is stopping and no longer accepts new connections";
     }
     return false;
   }
@@ -315,7 +328,18 @@ bool WorkerLoop::AddConnectionOnOwnerThread(rpc::common::UniqueFd fd,
   // 步骤2：创建 ConnectionState，但先不启动协程。
   // 先放入 map，再启动协程，确保生命周期归属清晰。
   auto state = std::make_unique<ConnectionState>(std::move(fd), registry_);
+  state->connection_token = next_connection_token_.fetch_add(1);
   state->connection.BindToWorkerLoop(worker_id_);
+  if (thread_pool_ != nullptr) {
+    const int captured_fd = raw_fd;
+    const std::uint64_t captured_token = state->connection_token;
+    state->connection.SetRequestDispatcher(
+        [this, captured_fd, captured_token](Connection::DispatchRequest request,
+                                            std::string* dispatch_error) {
+          return DispatchRequestToThreadPool(
+              captured_fd, captured_token, std::move(request), dispatch_error);
+        });
+  }
 
   // 步骤3：将连接状态存入 map
   const auto [it, inserted] = connections_.emplace(raw_fd, std::move(state));
@@ -394,6 +418,9 @@ bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
       return false;
     }
     if (!DrainPendingConnections(error_msg)) {
+      return false;
+    }
+    if (!DrainCompletedResponses(error_msg)) {
       return false;
     }
   }
@@ -476,23 +503,8 @@ bool WorkerLoop::PollOnce(int timeout_ms, std::string* error_msg) {
     }
 
     // 3.6 更新 epoll 事件注册
-    // 根据是否有待发送数据，动态调整监听的事件
-    epoll_event next_ev{};
-    next_ev.events = EPOLLIN | EPOLLRDHUP;
-    if (state.connection.HasPendingWrite()) {
-      // 有数据待发送，监听可写事件
-      next_ev.events |= EPOLLOUT;
-    }
-    next_ev.data.fd = fd;
-    if (::epoll_ctl(epoll_fd_.Get(), EPOLL_CTL_MOD, fd, &next_ev) < 0) {
-      const std::string reason =
-          std::string("epoll_ctl mod failed: ") + std::strerror(errno);
-      if (!CloseConnection(fd, reason)) {
-        if (error_msg != nullptr) {
-          *error_msg = "failed to close connection after epoll mod failure";
-        }
-        return false;
-      }
+    if (!UpdateEpollInterest(fd, state, error_msg)) {
+      return false;
     }
   }
 
@@ -511,6 +523,28 @@ std::size_t WorkerLoop::ConnectionCount() const noexcept {
 
 std::size_t WorkerLoop::TotalAcceptedCount() const noexcept {
   return total_accepted_count_.load();
+}
+
+std::size_t WorkerLoop::InFlightRequestCount() const noexcept {
+  return in_flight_request_count_.load();
+}
+
+std::size_t WorkerLoop::SubmittedRequestCount() const noexcept {
+  return submitted_request_count_.load();
+}
+
+std::size_t WorkerLoop::CompletedRequestCount() const noexcept {
+  return completed_request_count_.load();
+}
+
+std::vector<WorkerLoop::MethodStatsSnapshot> WorkerLoop::MethodStats() const {
+  std::vector<MethodStatsSnapshot> snapshot;
+  std::lock_guard<std::mutex> lock(method_stats_mutex_);
+  snapshot.reserve(method_stats_.size());
+  for (const auto& [method, stats] : method_stats_) {
+    snapshot.push_back(MethodStatsSnapshot{method, stats.first, stats.second});
+  }
+  return snapshot;
 }
 
 bool WorkerLoop::IsAcceptingNewConnections() const noexcept {
@@ -599,6 +633,319 @@ bool WorkerLoop::DrainPendingConnections(std::string* error_msg) {
   return true;
 }
 
+/**
+ * @brief 处理已完成的响应队列
+ *
+ * 从 completed_queue_ 中取出线程池工作线程完成的响应，
+ * 并将响应发送给对应的客户端连接。
+ *
+ * ## 执行流程
+ *
+ * 1. 将完成队列中的响应批量交换到本地队列（减少锁持有时间）
+ * 2. 遍历每个已完成的响应：
+ *    a. 更新统计计数器（in_flight、completed）
+ *    b. 通过 fd 和 connection_token 定位目标连接
+ *    c. 构建 RpcResponse 并加入连接的发送队列
+ *    d. 唤醒连接协程以触发响应发送
+ *    e. 更新 epoll 事件关注
+ *
+ * ## 线程安全
+ *
+ * - 必须在 owner 线程（worker loop 线程）中调用
+ * - 通过 mutex 保护 completed_queue_ 的并发访问
+ *
+ * ## 连接令牌验证
+ *
+ * 通过 connection_token 验证响应归属，防止：
+ * - 连接已关闭并复用 fd 的场景
+ * - 迟到的响应发送到错误连接
+ *
+ * @param error_msg 错误信息输出参数
+ * @return true 处理成功
+ * @return false 处理过程中发生错误
+ */
+bool WorkerLoop::DrainCompletedResponses(std::string* error_msg) {
+  if (!EnsureOwnerThread(error_msg)) {
+    return false;
+  }
+
+  if (completed_queue_ == nullptr) {
+    return true;
+  }
+
+  // 批量交换到本地队列，减少锁持有时间
+  std::deque<CompletedResponse> local;
+  {
+    std::lock_guard<std::mutex> lock(completed_queue_->mutex);
+    local.swap(completed_queue_->responses);
+  }
+
+  // 处理每个已完成的响应
+  while (!local.empty()) {
+    CompletedResponse completed = std::move(local.front());
+    local.pop_front();
+
+    // 更新请求统计计数
+    if (in_flight_request_count_.load() > 0) {
+      in_flight_request_count_.fetch_sub(1);
+    }
+    completed_request_count_.fetch_add(1);
+
+    // 通过 fd 查找目标连接
+    const auto it = connections_.find(completed.fd);
+    if (it == connections_.end()) {
+      // 连接已不存在，丢弃响应
+      continue;
+    }
+
+    ConnectionState& state = *it->second;
+    // 验证连接令牌，防止 fd 复用导致错发
+    if (state.connection_token != completed.connection_token) {
+      // 令牌不匹配，连接可能已关闭并重新建立，丢弃响应
+      continue;
+    }
+
+    // 构建 RpcResponse 消息
+    rpc::RpcResponse response;
+    response.set_request_id(completed.request_id);
+    response.set_error_code(
+        static_cast<rpc::ErrorCode>(completed.proto_error_code));
+    response.set_error_msg(completed.error_msg);
+    response.set_payload(completed.payload);
+
+    // 将响应加入连接的发送队列
+    std::string queue_error;
+    if (!state.connection.EnqueueResponse(response, &queue_error)) {
+      const std::string reason =
+          queue_error.empty() ? "enqueue response failed" : queue_error;
+      if (!CloseConnection(completed.fd, reason)) {
+        if (error_msg != nullptr) {
+          *error_msg = "failed to close connection after enqueue failure";
+        }
+        return false;
+      }
+      continue;
+    }
+
+    // 唤醒读等待协程，让连接主协程有机会进入写回分支。
+    state.connection.NotifyReadable();
+
+    // 更新 epoll 事件关注（可能需要监听 EPOLLOUT）
+    if (!UpdateEpollInterest(completed.fd, state, error_msg)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * @brief 更新连接的 epoll 事件关注
+ *
+ * 根据连接当前状态动态调整 epoll 监听的事件类型。
+ * 这是实现非阻塞 I/O 的关键：只在需要时监听可写事件。
+ *
+ * ## 事件关注策略
+ *
+ * - **EPOLLIN**：始终监听，需要接收客户端请求
+ * - **EPOLLRDHUP**：始终监听，检测对端关闭连接
+ * - **EPOLLOUT**：仅在有数据待发送时监听
+ *
+ * ## 为什么动态调整 EPOLLOUT
+ *
+ * Socket 通常处于可写状态（发送缓冲区未满）。
+ * 如果一直监听 EPOLLOUT，epoll_wait 会立即返回，
+ * 导致 CPU 空转。因此只在写缓冲区非空时才监听。
+ *
+ * @param fd 连接的文件描述符
+ * @param state 连接状态引用
+ * @param error_msg 错误信息输出参数
+ * @return true 更新成功
+ * @return false 更新失败（已尝试关闭连接）
+ */
+bool WorkerLoop::UpdateEpollInterest(int fd, ConnectionState& state,
+                                     std::string* error_msg) {
+  epoll_event next_ev{};
+  // 基础事件：可读 + 对端关闭检测
+  next_ev.events = EPOLLIN | EPOLLRDHUP;
+  // 仅在有数据待发送时监听可写事件
+  if (state.connection.HasPendingWrite()) {
+    next_ev.events |= EPOLLOUT;
+  }
+  next_ev.data.fd = fd;
+  // 使用 EPOLL_CTL_MOD 修改已注册的 fd 事件
+  if (::epoll_ctl(epoll_fd_.Get(), EPOLL_CTL_MOD, fd, &next_ev) < 0) {
+    const std::string reason =
+        std::string("epoll_ctl mod failed: ") + std::strerror(errno);
+    if (!CloseConnection(fd, reason)) {
+      if (error_msg != nullptr) {
+        *error_msg = "failed to close connection after epoll mod failure";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool WorkerLoop::DispatchRequestToThreadPool(
+    int fd, std::uint64_t connection_token, Connection::DispatchRequest request,
+    std::string* error_msg) {
+  // -------------------------------------------------------------------------
+  // 阶段1：入口校验（当前线程 = worker owner 线程）
+  //
+  // 这里还在 worker loop 线程里，只做“能否投递”的快速判断，不做耗时业务。
+  // 如果线程池或回投队列未就绪，直接失败，让上层走现有错误路径。
+  // -------------------------------------------------------------------------
+  if (thread_pool_ == nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = "thread pool not configured";
+    }
+    return false;
+  }
+
+  if (completed_queue_ == nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = "worker completion queue not initialized";
+    }
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // 阶段2：把请求封装成任务并投递到线程池
+  //
+  // 捕获内容说明：
+  // - this: 访问 registry_、completed_queue_、统计接口。
+  // - fd + connection_token: 用于结果回投时做连接身份校验，避免 fd 复用误投。
+  // - request(move): 业务参数所有权转移到线程池任务，避免额外拷贝。
+  //
+  // 注意：Submit 只表示“任务入队成功”，不表示业务执行成功。
+  // -------------------------------------------------------------------------
+  const bool submitted = thread_pool_->Submit(
+      [this, fd, connection_token, request = std::move(request)]() mutable {
+        // -------------------------------------------------------------------
+        // 阶段3：在线程池工作线程执行业务逻辑
+        //
+        // 该 lambda 运行在业务线程，不在 owner loop 线程。
+        // 这里不能直接操作 connections_ / epoll，只能产出 CompletedResponse
+        // 并回投到 completed_queue_，由 owner loop 串行消费。
+        // -------------------------------------------------------------------
+        CompletedResponse completed;
+        completed.fd = fd;
+        completed.connection_token = connection_token;
+        completed.request_sequence = request.sequence;
+        completed.request_id = request.request_id;
+        completed.method_key = request.service_name + "." + request.method_name;
+        completed.proto_error_code = rpc::OK;
+
+        // 查找业务方法并执行。
+        // 约定：任何异常都在这里转换为协议错误码，确保不会把异常抛出线程池边界。
+        const auto handler =
+            registry_.Find(request.service_name, request.method_name);
+        if (!handler.has_value()) {
+          completed.proto_error_code = rpc::METHOD_NOT_FOUND;
+          completed.error_msg = "method not found: " + request.service_name +
+                                "." + request.method_name;
+        } else {
+          try {
+            completed.payload = handler->get()(request.payload);
+            completed.handler_success = true;
+          } catch (const RpcError& ex) {
+            completed.proto_error_code = common::ToProtoErrorCode(ex.code());
+            completed.error_msg = ex.what();
+          } catch (const std::exception& ex) {
+            completed.proto_error_code = rpc::INTERNAL_ERROR;
+            completed.error_msg =
+                std::string("handler exception: ") + ex.what();
+          } catch (...) {
+            completed.proto_error_code = rpc::INTERNAL_ERROR;
+            completed.error_msg = "handler threw unknown exception";
+          }
+        }
+
+        // 记录按方法维度的调用统计（总调用/失败调用）。
+        RecordMethodCall(completed.method_key, completed.handler_success);
+
+        // -------------------------------------------------------------------
+        // 阶段4：回投完成结果到 owner 线程消费队列
+        //
+        // 仅在 accepting=true 时入队，避免 worker 正在退出时继续堆积结果。
+        // -------------------------------------------------------------------
+        {
+          std::lock_guard<std::mutex> lock(completed_queue_->mutex);
+          if (completed_queue_->accepting.load()) {
+            completed_queue_->responses.push_back(std::move(completed));
+          }
+        }
+
+        // -------------------------------------------------------------------
+        // 阶段5：唤醒 owner loop 线程
+        //
+        // owner loop 在 PollOnce 中会 drain wake fd，然后调用
+        // DrainCompletedResponses()，把 completed_queue_ 里的结果写回连接。
+        // -------------------------------------------------------------------
+        const int wake_fd = completed_queue_->wake_fd;
+        if (wake_fd >= 0) {
+          const std::uint64_t one = 1;
+          const ssize_t rc = ::write(wake_fd, &one, sizeof(one));
+          if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            common::LogWarn(std::string("worker completion wake failed: ") +
+                            std::strerror(errno));
+          }
+        }
+      });
+
+  // Submit 失败：任务未进入线程池队列，调用方可立即按失败处理。
+  if (!submitted) {
+    if (error_msg != nullptr) {
+      *error_msg = "thread pool rejected task submission";
+    }
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // 阶段6：投递成功后的请求统计
+  //
+  // - submitted_request_count_: 成功入队到线程池的请求数。
+  // - in_flight_request_count_: 尚未回投处理完成的请求数。
+  //   对应减法发生在 DrainCompletedResponses()。
+  // -------------------------------------------------------------------------
+  submitted_request_count_.fetch_add(1);
+  in_flight_request_count_.fetch_add(1);
+  return true;
+}
+
+/**
+ * @brief 记录方法调用统计
+ *
+ * 线程安全地更新方法维度的调用统计，用于监控和分析 RPC 服务性能。
+ *
+ * ## 统计维度
+ *
+ * - 总调用次数（stats.first）
+ * - 失败调用次数（stats.second）
+ *
+ * ## 线程安全
+ *
+ * 该方法可能被多个线程池工作线程并发调用，
+ * 因此使用 method_stats_mutex_ 保护 method_stats_ 的并发访问。
+ *
+ * ## 使用场景
+ *
+ * - DispatchRequestToThreadPool() 中业务处理完成后调用
+ * - 记录成功和失败的请求，便于计算成功率
+ *
+ * @param method 方法名称，格式为 "service.method"
+ * @param success 业务处理是否成功
+ */
+void WorkerLoop::RecordMethodCall(std::string method, bool success) {
+  std::lock_guard<std::mutex> lock(method_stats_mutex_);
+  auto& stats = method_stats_[std::move(method)];
+  ++stats.first;   // 总调用次数
+  if (!success) {
+    ++stats.second;  // 失败调用次数
+  }
+}
+
 bool WorkerLoop::DrainWakeFd(std::string* error_msg) {
   if (!EnsureOwnerThread(error_msg)) {
     return false;
@@ -667,8 +1014,14 @@ void WorkerLoop::Run() {
   accepting_new_connections_.store(false);
   if (DrainWakeFd(&error)) {
     (void)DrainPendingConnections(&error);
+    (void)DrainCompletedResponses(&error);
   }
   CloseAllConnections();
+
+  if (completed_queue_ != nullptr) {
+    completed_queue_->accepting.store(false);
+    completed_queue_->wake_fd = -1;
+  }
 }
 
 }  // namespace rpc::server

@@ -44,6 +44,7 @@
 #include <string>       // std::string
 #include <string_view>  // std::string_view
 #include <thread>
+#include <utility>
 
 #include "common/log.h"               // 日志输出
 #include "common/rpc_error.h"         // RPC 错误定义
@@ -148,7 +149,10 @@ bool Connection::OnWritable(std::string* error_msg) {
     return false;
   }
   if (!HasPendingWrite()) {
+    ClearWriteDeadline();
     state_ = State::kOpen;
+  } else {
+    ArmWriteDeadline();
   }
   return true;
 }
@@ -191,6 +195,20 @@ const char* Connection::StateName() const noexcept {
 
 const std::string& Connection::LastError() const noexcept {
   return last_error_;
+}
+
+/**
+ * @brief 检查是否设置了请求分发器
+ *
+ * 用于判断连接是否配置了外部请求分发机制（如线程池）。
+ * 当返回 true 时，请求会通过分发器异步处理；
+ * 当返回 false 时，请求在当前协程中同步处理。
+ *
+ * @return true 已设置请求分发器
+ * @return false 未设置请求分发器，使用默认同步处理
+ */
+bool Connection::HasRequestDispatcher() const noexcept {
+  return static_cast<bool>(request_dispatcher_);
 }
 
 void Connection::BindToWorkerLoop(std::size_t worker_id) noexcept {
@@ -531,6 +549,55 @@ void Connection::NotifyWritable() noexcept {
   state_ = State::kWriting;
   // 唤醒等待可写事件的协程
   ResumeWaiter(write_waiter_);
+}
+
+/**
+ * @brief 设置请求分发器
+ *
+ * 配置外部请求分发机制，允许将请求处理委托给线程池等异步处理框架。
+ * 当设置了分发器后，TryParseRequests() 会通过分发器异步处理请求，
+ * 而不是在当前协程中同步调用 HandleOneRequest()。
+ *
+ * ## 使用场景
+ *
+ * - 配合 WorkerLoop + ThreadPool 实现请求的异步处理
+ * - 将耗时的业务逻辑从 I/O 线程分离，提高并发性能
+ *
+ * ## 线程安全
+ *
+ * 必须在 owner 线程（worker loop 线程）中调用。
+ *
+ * @param dispatcher 请求分发函数，接收 DispatchRequest 并返回是否分发成功
+ */
+void Connection::SetRequestDispatcher(RequestDispatchFn dispatcher) {
+  AssertOwnerThread();
+  request_dispatcher_ = std::move(dispatcher);
+}
+
+/**
+ * @brief 将响应加入发送队列
+ *
+ * 将响应序列化并加入写缓冲区，等待后续发送。
+ * 与 QueueResponse() 的区别在于此方法会设置写超时定时器。
+ *
+ * ## 设计要点
+ *
+ * - 线程安全：必须在 owner 线程调用
+ * - 超时管理：入队成功后启动写超时定时器，防止响应长时间未发送
+ *
+ * @param response 要发送的 RPC 响应
+ * @param error_msg 错误信息输出参数
+ * @return true 入队成功
+ * @return false 入队失败（如缓冲区满、序列化失败等）
+ */
+bool Connection::EnqueueResponse(const rpc::RpcResponse& response,
+                                 std::string* error_msg) {
+  AssertOwnerThread();
+  const bool queued = QueueResponse(response, error_msg);
+  if (queued) {
+    ArmWriteDeadline();
+  }
+  return queued;
 }
 
 /**
@@ -892,19 +959,34 @@ bool Connection::TryParseRequests(std::string* error_msg) {
       response.set_request_id("");
       response.set_error_code(rpc::PARSE_ERROR);
       response.set_error_msg("failed to parse RpcRequest");
-      if (!QueueResponse(response, error_msg)) {
+      if (!EnqueueResponse(response, error_msg)) {
         return false;
       }
     } else {
-      // 解析成功：处理请求
-      if (!HandleOneRequest(request, &response)) {
-        if (error_msg != nullptr) {
-          *error_msg = "failed to handle request";
+      if (request_dispatcher_) {
+        DispatchRequest dispatch;
+        dispatch.sequence = ++next_request_sequence_;
+        dispatch.request_id = request.request_id();
+        dispatch.service_name = request.service_name();
+        dispatch.method_name = request.method_name();
+        dispatch.payload = request.payload();
+        if (!request_dispatcher_(std::move(dispatch), error_msg)) {
+          if (error_msg != nullptr && error_msg->empty()) {
+            *error_msg = "failed to dispatch request";
+          }
+          return false;
         }
-        return false;
-      }
-      if (!QueueResponse(response, error_msg)) {
-        return false;
+      } else {
+        // 解析成功：处理请求
+        if (!HandleOneRequest(request, &response)) {
+          if (error_msg != nullptr) {
+            *error_msg = "failed to handle request";
+          }
+          return false;
+        }
+        if (!EnqueueResponse(response, error_msg)) {
+          return false;
+        }
       }
     }
 

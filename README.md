@@ -18,8 +18,10 @@
 - epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
 - 当前服务端已升级为多 WorkerLoop / one-loop-per-thread（最小可用版）
 - RpcServer 通过 round-robin 分发新连接，worker 通过 eventfd + 队列在所属线程接管连接
+- 新增最小业务线程池：handler 执行与连接 I/O 主路径解耦
+- 业务线程只产出结果，不直接访问 Connection；结果通过 worker 的回投队列回到 owner worker
 - RpcServer 已具备最小生命周期控制：Start/Stop 与 worker 收敛回收
-- 当前仍是轻量版本：不包含多 reactor / 线程池 / io_uring
+- 当前仍是轻量版本：不包含多 reactor / io_uring / 外部依赖
 - 这一步为后续服务端 coroutine 化与更强事件驱动打基础
 
 当前版本已将 coroutine API 从“future bridge”升级为“direct waiter”模式：
@@ -34,6 +36,8 @@
 - 通用 RPC 请求/响应消息（`RpcRequest` / `RpcResponse`）
 - 自定义协议：`[4字节长度][protobuf数据]`
 - 服务端 Acceptor + 多 WorkerLoop（one-loop-per-thread）
+- 服务端最小业务线程池（可配置开关：0 表示 inline 执行）
+- owner-worker 回投模型（业务结果回投到连接归属 worker 再入写缓冲）
 - 服务端方法注册与分发（`service_name + method_name -> handler`）
 - 客户端通用调用接口
 - 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
@@ -45,6 +49,7 @@
 - 客户端读写分工模型（调用线程发送 + event loop 驱动可读事件）
 - 自动化测试入口（协议层、注册中心、端到端）
 - Benchmark 入口（单连接延迟与吞吐）
+- 慢 handler 场景对比 benchmark（inline 执行 vs thread pool 执行）
 - PendingCalls（`request_id -> result slot`）与连接关闭竞态保护
 
 ## 2. 架构说明
@@ -84,8 +89,11 @@
   - Acceptor 角色：listen socket 初始化、accept 新连接
   - 按 round-robin 将新连接分发给多个 WorkerLoop
   - 只负责接入和分发，不直接驱动连接协程
+  - 管理最小业务线程池生命周期（Start/Stop/Join）
+  - `business_thread_count=0` 时可切回 inline handler 执行（用于对比 benchmark）
   - 持有 listen fd / accept epoll / workers 成员，统一管理生命周期
   - 提供最小 `Stop()`：停止接入、通知 worker 停止、等待 worker join
+  - 提供运行时轻量统计快照（worker 连接数、in-flight、线程池统计）
 
 - `src/server/worker_loop.*`
   - 每个 worker 运行在独立线程（one-loop-per-thread）
@@ -93,6 +101,8 @@
   - 通过线程安全 pending 队列接收 acceptor 投递的新连接
   - 在 worker 线程中注册/移除 client fd（保证线程亲和）
   - 驱动连接可读/可写事件与连接协程主路径
+  - 可选把业务执行提交到线程池，并通过 completed-response 队列回投 owner worker
+  - worker 内统一将回投响应入连接写缓冲，不允许业务线程直接触碰连接对象
   - 执行连接 timeout tick 与关闭收敛
   - 停止路径分阶段：stop requested -> 不再接收新连接 -> drain pending -> 收敛现有连接
   - 明确线程亲和：worker loop 只允许 owner 线程调用
@@ -103,8 +113,9 @@
   - 适配非阻塞 socket，处理 `EINTR` / `EAGAIN` / `EWOULDBLOCK`
   - 从 socket 读入字节流并在 `read_buffer` 上做长度前缀拆帧
   - 支持半包保留与多包批量解析（一次读取可处理多条请求）
-  - 通过 `ServiceRegistry` 执行业务 handler，统一映射错误到 `RpcResponse`
+  - 在 inline 模式下可直接执行 handler；在线程池模式下只做解帧并把请求投递给 worker dispatcher
   - 将响应帧写入 `write_buffer` 并在可写事件中 flush 到 socket
+  - 提供 owner-worker 入响应接口（EnqueueResponse），保证线程边界清晰
   - 新增协程接口：`ReadRequestCo/WriteResponseCo`
   - 新增协程等待点：`WaitReadableCo/WaitWritableCo`
   - 新增 epoll 通知恢复入口：`NotifyReadable/NotifyWritable`
@@ -116,18 +127,18 @@
 
 ## 服务端演进说明（当前阶段）
 
-当前版本是最小可用多线程协程服务端（one-loop-per-thread），但仍不是 io_uring / 线程池 / 完整生产级框架。
+当前版本是最小可用多线程协程服务端（one-loop-per-thread），并已补上“连接 I/O 线程 + 业务执行线程”的最小分工，但仍不是完整生产级框架。
 
 本次抽象的价值：
 - 固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
 - 固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
-- 在最小改动下落地 one-loop-per-thread，继续复用现有 coroutine 主路径
+- 在最小改动下落地“业务线程池 + owner-worker 回投”模型，继续复用现有 coroutine 主路径
 - 增强工程可控性：具备可测试的 Start/Stop 生命周期与清晰收敛语义
 
-为什么当前不引入线程池 / io_uring：
-- 线程池会把 I/O 驱动与业务执行模型耦合复杂化，不利于当前阶段教学与调试
-- io_uring 会显著扩大系统复杂度和故障面，不适合这一步的小步演进目标
-- 当前优先把线程边界、协程收敛、生命周期一致性打磨扎实
+这次已引入的是“最小线程池”，不是复杂任务系统：
+- 不做 work-stealing / priority queue / future-heavy 框架
+- 不引入外部系统，不改 protobuf 主协议
+- 不允许业务线程直接访问 `Connection` 或跨线程 `epoll_ctl`
 
 后续如果继续演进，可沿这些方向推进：
 1. 从 round-robin 演进到更强分发策略（负载、连接数、CPU 亲和）
@@ -163,6 +174,11 @@
 - `src/common/rpc_error.h`
   - 定义框架错误枚举与 `std::error_code` category
   - 提供 protobuf 错误码与框架错误码的双向转换
+
+- `src/common/thread_pool.*`
+  - 固定线程数最小线程池
+  - 提供 `Submit/Stop/Join`
+  - 提供基础统计：active workers、queue size、submitted/completed
 
 - `src/common/unique_fd.h`
   - 提供 move-only 的 fd RAII 包装，避免手动 `close` 泄漏
@@ -341,7 +357,7 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
 
 ## 11. 测试
 
-本项目已提供 17 类可重复执行测试：
+本项目已提供 21 类可重复执行测试：
 
 - `event_loop_test`：event loop 基础行为
   - 可读事件触发
@@ -435,6 +451,12 @@ rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
   - `Call / CallAsync / CallCo` 在多 worker 服务端下行为正确
   - 停止后客户端调用可预期失败，避免悬挂
 
+- `server_thread_pool_integration_test`：线程池解耦与竞态收敛验证
+  - `Call / CallAsync / CallCo` 在线程池模式下回归正确
+  - 慢 handler 并发场景响应不丢
+  - 连接关闭后后台完成结果可安全丢弃，不发生 UAF
+  - 校验 worker 与线程池的基础统计可用
+
 - `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
   - 多个 client 连接同时存在
   - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
@@ -465,7 +487,12 @@ ctest --output-on-failure -R 'call_co_basic_test|call_co_out_of_order_test|call_
 
 ## 12. Benchmark
 
-提供单连接基准程序 `rpc_benchmark`，默认执行 1000 次 Add 调用，输出：
+提供两个最小 benchmark：
+
+- `rpc_benchmark`：单连接基础延迟/吞吐
+- `rpc_thread_pool_benchmark`：慢 handler 场景下，对比 inline 执行与线程池执行
+
+`rpc_benchmark` 默认执行 1000 次 Add 调用，输出：
 
 - 平均延迟（avg）
 - p95 延迟
@@ -478,23 +505,39 @@ cd rpc_project/build
 ./rpc_benchmark 1000
 ```
 
+`rpc_thread_pool_benchmark` 默认对比：
+- 场景 A：`business_thread_count=0`（inline handler）
+- 场景 B：`business_thread_count=4`（thread pool handler）
+
+运行示例：
+
+```bash
+cd rpc_project/build
+./rpc_thread_pool_benchmark 128 16 20
+```
+
+参数含义：
+- 第 1 个参数：总请求数
+- 第 2 个参数：并发客户端数
+- 第 3 个参数：慢 handler 的 sleep 毫秒数
+
+输出会包含两种模式的 avg/p95/qps 以及 `qps_speedup`。
+
 ## 13. 可扩展性说明
 
-当前代码保持阻塞式最小闭环，但接口设计已为后续扩展预留：
-- `Codec` 可替换为异步读写实现（epoll/io_uring）
-- 客户端已具备轻量 reactor 骨架，可演进为 coroutine 驱动 I/O
-- 服务端已从过程式 `HandleClient` 循环演进到 `Connection + buffer` 模型
-- 当前服务端仍不是完整生产级 reactor，但连接层次已可平滑接入 epoll
-- `RpcServer` 的连接驱动可继续演进到事件驱动或协程调度
-- `ServiceRegistry` 与 handler 签名可平滑扩展为 `future/awaitable`
+当前版本不是生产级 RPC 框架，定位是“可运行、可讲清楚、可继续演进”的工程化样例：
+- 保留当前多 WorkerLoop + Connection coroutine 主路径
+- 增加最小业务线程池与 owner-worker 回投，不做大规模 runtime 改造
+- 保持客户端 `Call/CallAsync/CallCo` 路径不变
 
-服务端 coroutine 方向说明：
-- 当前是“连接级 coroutine 主路径 + 单线程 epoll”阶段，不是完整 coroutine runtime
-- 不引入多线程 reactor / io_uring，继续以单线程 epoll 作为 I/O readiness 基座
-- 后续可继续增加连接协程的 deadline、取消、背压策略与更细粒度状态机
-- 架构扩展路径：在当前 one-loop-per-thread 基础上，继续加强分发、取消与执行模型
+这次明确不做：
+- io_uring 改造
+- 外部系统依赖（Redis/数据库/外部队列）
+- 复杂任务系统（work stealing、优先级队列、复杂取消框架）
 
-coroutine API 的后续演进方向：
-- 进一步减少 bridge 残余路径与对象复制开销
-- 演进为更完整的 coroutine-driven RPC runtime（调度与取消语义）
-- 可继续探索 io_uring / 更强事件驱动模型
+后续可继续做深但本次不做：
+1. 请求级并发调度与更细粒度取消
+2. 更完整的 graceful shutdown（请求截止时间、分阶段 drain 策略）
+3. 更强 metrics/tracing（指标导出与链路观测）
+4. 连接池与客户端负载均衡
+5. benchmark 场景深化（更多 payload 分布与多机对比）

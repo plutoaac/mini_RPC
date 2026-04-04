@@ -77,6 +77,8 @@
 #include <chrono>     // steady_clock, milliseconds
 #include <coroutine>  // std::coroutine_handle
 #include <cstddef>    // std::size_t
+#include <cstdint>
+#include <functional>
 #include <optional>   // std::optional
 #include <string>     // std::string
 #include <string_view>
@@ -137,6 +139,17 @@ class ServiceRegistry;
  */
 class Connection {
  public:
+  struct DispatchRequest {
+    std::uint64_t sequence{0};
+    std::string request_id;
+    std::string service_name;
+    std::string method_name;
+    std::string payload;
+  };
+
+  using RequestDispatchFn =
+      std::function<bool(DispatchRequest request, std::string* error_msg)>;
+
   /**
    * @brief 连接状态枚举
    *
@@ -273,6 +286,7 @@ class Connection {
   [[nodiscard]] State GetState() const noexcept;
   [[nodiscard]] const char* StateName() const noexcept;
   [[nodiscard]] const std::string& LastError() const noexcept;
+  [[nodiscard]] bool HasRequestDispatcher() const noexcept;
 
   // 绑定连接到某个 WorkerLoop。当前线程会被记录为 owner thread。
   void BindToWorkerLoop(std::size_t worker_id) noexcept;
@@ -359,6 +373,11 @@ class Connection {
 
   void NotifyReadable() noexcept;
   void NotifyWritable() noexcept;
+
+  void SetRequestDispatcher(RequestDispatchFn dispatcher);
+
+  [[nodiscard]] bool EnqueueResponse(const rpc::RpcResponse& response,
+                                     std::string* error_msg);
 
  private:
   // =========================================================================
@@ -531,6 +550,9 @@ class Connection {
   std::optional<std::chrono::steady_clock::time_point> write_deadline_;
   std::coroutine_handle<> read_waiter_{};
   std::coroutine_handle<> write_waiter_{};
+
+  RequestDispatchFn request_dispatcher_;
+  std::uint64_t next_request_sequence_{0};
 
   std::optional<std::size_t> owner_worker_id_;
   std::thread::id owner_thread_id_{};

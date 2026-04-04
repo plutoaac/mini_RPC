@@ -72,13 +72,16 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>  // std::uint16_t
-#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
+#include "common/thread_pool.h"
 #include "common/unique_fd.h"         // RAII 文件描述符封装
 #include "server/service_registry.h"  // 服务注册表
 
@@ -119,6 +122,27 @@ class WorkerLoop;
  */
 class RpcServer {
  public:
+  struct MethodRuntimeStats {
+    std::string method;
+    std::size_t call_count{0};
+    std::size_t failure_count{0};
+  };
+
+  struct WorkerRuntimeStats {
+    std::size_t worker_id{0};
+    std::size_t current_connections{0};
+    std::size_t total_accepted_connections{0};
+    std::size_t in_flight_requests{0};
+    std::size_t submitted_requests{0};
+    std::size_t completed_requests{0};
+    std::vector<MethodRuntimeStats> method_stats;
+  };
+
+  struct RuntimeStatsSnapshot {
+    std::vector<WorkerRuntimeStats> workers;
+    std::optional<rpc::common::StatsSnapshot> business_thread_pool;
+  };
+
   /**
    * @brief 构造 RpcServer 实例
    *
@@ -138,7 +162,8 @@ class RpcServer {
    * @endcode
    */
   RpcServer(std::uint16_t port, const ServiceRegistry& registry,
-            std::size_t worker_count = 2U);
+            std::size_t worker_count = 2U,
+            std::size_t business_thread_count = 2U);
 
   ~RpcServer();
 
@@ -155,17 +180,17 @@ class RpcServer {
    * 4. 绑定端口
    * 5. 开始监听（backlog=128）
    * 6. 创建 epoll 实例
-    * 7. 注册监听 socket 到 epoll
-    *
-    * ## 事件循环
-    *
-    * 进入事件循环处理接入与分发：
-    * - 新连接：accept4 创建客户端 socket
-    * - 分发：投递给 WorkerLoop，由 worker 线程接管连接生命周期
-    * - 停机：收到 Stop() 请求后退出循环并统一收敛资源
-    *
-    * @return true 正常停机退出（通常由 Stop() 触发）
-    * @return false 初始化失败或运行时致命错误
+   * 7. 注册监听 socket 到 epoll
+   *
+   * ## 事件循环
+   *
+   * 进入事件循环处理接入与分发：
+   * - 新连接：accept4 创建客户端 socket
+   * - 分发：投递给 WorkerLoop，由 worker 线程接管连接生命周期
+   * - 停机：收到 Stop() 请求后退出循环并统一收敛资源
+   *
+   * @return true 正常停机退出（通常由 Stop() 触发）
+   * @return false 初始化失败或运行时致命错误
    *
    * ## 错误处理
    *
@@ -179,8 +204,8 @@ class RpcServer {
    * - epoll_ctl() 注册失败
    * - epoll_wait() 返回错误（非 EINTR）
    *
-    * @note 此方法会阻塞当前线程，直到 Stop() 或发生致命错误
-    * @note Stop() 是最小可用停机接口：触发停止接入并等待 Start() 收敛完成
+   * @note 此方法会阻塞当前线程，直到 Stop() 或发生致命错误
+   * @note Stop() 是最小可用停机接口：触发停止接入并等待 Start() 收敛完成
    *
    * ## 示例
    *
@@ -199,9 +224,13 @@ class RpcServer {
   // 该接口是幂等的，适合测试和析构场景重复调用。
   bool Stop();
 
+  [[nodiscard]] RuntimeStatsSnapshot StatsSnapshot() const;
+
  private:
   bool InitAcceptor(std::string* error_msg);
+  bool StartBusinessThreadPool(std::string* error_msg);
   bool StartWorkers(std::string* error_msg);
+  void StopBusinessThreadPool();
   void StopWorkers();
   void CloseAcceptor();
 
@@ -220,6 +249,7 @@ class RpcServer {
   std::uint16_t port_;
 
   std::size_t worker_count_;
+  std::size_t business_thread_count_;
 
   /**
    * @brief 服务注册表引用
@@ -232,13 +262,14 @@ class RpcServer {
 
   common::UniqueFd listen_fd_;
   common::UniqueFd accept_epoll_fd_;
+  std::unique_ptr<rpc::common::ThreadPool> business_thread_pool_;
   std::vector<std::unique_ptr<WorkerLoop>> workers_;
   std::size_t next_worker_{0};
 
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> accepting_new_connections_{false};
 
-  std::mutex lifecycle_mu_;
+  mutable std::mutex lifecycle_mu_;
   std::condition_variable lifecycle_cv_;
   bool running_{false};
 };
