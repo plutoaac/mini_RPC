@@ -1,114 +1,367 @@
-#include <signal.h>
-#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
-#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "calc.pb.h"
+#include "benchmark_stats.h"
 #include "client/rpc_client.h"
+#include "coroutine/task.h"
+#include "server/rpc_server.h"
+#include "server/service_registry.h"
 
 namespace {
 
-bool WaitServerReady(const std::chrono::milliseconds timeout) {
-  const auto start = std::chrono::steady_clock::now();
-  rpc::client::RpcClient probe(
-      "127.0.0.1", 50051,
-      {.send_timeout = std::chrono::milliseconds(200),
-       .recv_timeout = std::chrono::milliseconds(200)});
+enum class BenchMode {
+  kSync,
+  kAsync,
+  kCoroutine,
+};
 
+struct BenchmarkOptions {
+  BenchMode mode{BenchMode::kSync};
+  int total_requests{10000};
+  int concurrency{8};
+  int payload_bytes{128};
+  std::uint16_t port{50051};
+  std::string output_dir{"benchmarks/results"};
+};
+
+bool CanConnect(const std::uint16_t port) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return false;
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  (void)::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+  const bool ok =
+      ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+  ::close(fd);
+  return ok;
+}
+
+bool WaitServerReady(const std::uint16_t port,
+                     const std::chrono::milliseconds timeout) {
+  const auto start = std::chrono::steady_clock::now();
   while (std::chrono::steady_clock::now() - start < timeout) {
-    if (probe.Connect()) {
+    if (CanConnect(port)) {
       return true;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   return false;
+}
+
+std::string BuildPayload(const int payload_bytes) {
+  const int bytes = std::max(1, payload_bytes);
+  return std::string(static_cast<std::size_t>(bytes), 'x');
+}
+
+bool IsTimeoutResult(const rpc::client::RpcCallResult& result) {
+  return result.status.message.find("timeout") != std::string::npos;
+}
+
+std::string ModeToString(const BenchMode mode) {
+  switch (mode) {
+    case BenchMode::kSync:
+      return "sync";
+    case BenchMode::kAsync:
+      return "async";
+    case BenchMode::kCoroutine:
+      return "co";
+  }
+  return "unknown";
+}
+
+bool ParseMode(const std::string& text, BenchMode* mode) {
+  if (text == "sync") {
+    *mode = BenchMode::kSync;
+    return true;
+  }
+  if (text == "async") {
+    *mode = BenchMode::kAsync;
+    return true;
+  }
+  if (text == "co") {
+    *mode = BenchMode::kCoroutine;
+    return true;
+  }
+  return false;
+}
+
+bool ParseIntArg(const std::string& value, int* out) {
+  char* end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || (end != nullptr && *end != '\0')) {
+    return false;
+  }
+  *out = static_cast<int>(parsed);
+  return true;
+}
+
+bool ParseArgs(const int argc, char** argv, BenchmarkOptions* options) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg(argv[i]);
+    if (arg.rfind("--mode=", 0) == 0) {
+      if (!ParseMode(arg.substr(7), &options->mode)) {
+        std::cerr << "invalid mode: " << arg.substr(7) << "\n";
+        return false;
+      }
+      continue;
+    }
+    if (arg.rfind("--requests=", 0) == 0) {
+      int value = 0;
+      if (!ParseIntArg(arg.substr(11), &value)) {
+        return false;
+      }
+      options->total_requests = std::max(1, value);
+      continue;
+    }
+    if (arg.rfind("--concurrency=", 0) == 0) {
+      int value = 0;
+      if (!ParseIntArg(arg.substr(14), &value)) {
+        return false;
+      }
+      options->concurrency = std::max(1, value);
+      continue;
+    }
+    if (arg.rfind("--payload_bytes=", 0) == 0) {
+      int value = 0;
+      if (!ParseIntArg(arg.substr(16), &value)) {
+        return false;
+      }
+      options->payload_bytes = std::max(1, value);
+      continue;
+    }
+    if (arg.rfind("--port=", 0) == 0) {
+      int value = 0;
+      if (!ParseIntArg(arg.substr(7), &value)) {
+        return false;
+      }
+      options->port = static_cast<std::uint16_t>(std::max(1, value));
+      continue;
+    }
+    if (arg.rfind("--output_dir=", 0) == 0) {
+      options->output_dir = arg.substr(13);
+      continue;
+    }
+
+    int value = 0;
+    if (!ParseIntArg(arg, &value)) {
+      std::cerr << "unknown arg: " << arg << "\n";
+      return false;
+    }
+    options->total_requests = std::max(1, value);
+  }
+  return true;
+}
+
+rpc::benchmark::LocalStats RunSyncWorker(rpc::client::RpcClient* client,
+                                         const std::string& payload,
+                                         const int request_count) {
+  rpc::benchmark::LocalStats stats;
+  stats.latency_us.reserve(static_cast<std::size_t>(request_count));
+
+  for (int i = 0; i < request_count; ++i) {
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto result = client->Call("BenchmarkService", "Echo", payload);
+    const auto t2 = std::chrono::steady_clock::now();
+
+    stats.latency_us.push_back(
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+
+    if (result.ok() && result.response_payload == payload) {
+      ++stats.success_count;
+    } else if (IsTimeoutResult(result)) {
+      ++stats.timeout_count;
+    } else {
+      ++stats.failed_count;
+    }
+  }
+
+  return stats;
+}
+
+rpc::benchmark::LocalStats RunAsyncWorker(rpc::client::RpcClient* client,
+                                          const std::string& payload,
+                                          const int request_count) {
+  rpc::benchmark::LocalStats stats;
+  stats.latency_us.reserve(static_cast<std::size_t>(request_count));
+
+  for (int i = 0; i < request_count; ++i) {
+    const auto t1 = std::chrono::steady_clock::now();
+    auto future = client->CallAsync("BenchmarkService", "Echo", payload);
+    const auto result = future.get();
+    const auto t2 = std::chrono::steady_clock::now();
+
+    stats.latency_us.push_back(
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+
+    if (result.ok() && result.response_payload == payload) {
+      ++stats.success_count;
+    } else if (IsTimeoutResult(result)) {
+      ++stats.timeout_count;
+    } else {
+      ++stats.failed_count;
+    }
+  }
+
+  return stats;
+}
+
+rpc::coroutine::Task<rpc::benchmark::LocalStats> RunCoroutineWorker(
+    rpc::client::RpcClient* client, const std::string* payload,
+    const int request_count) {
+  rpc::benchmark::LocalStats stats;
+  stats.latency_us.reserve(static_cast<std::size_t>(request_count));
+
+  for (int i = 0; i < request_count; ++i) {
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto result =
+        co_await client->CallCo("BenchmarkService", "Echo", *payload);
+    const auto t2 = std::chrono::steady_clock::now();
+
+    stats.latency_us.push_back(
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+
+    if (result.ok() && result.response_payload == *payload) {
+      ++stats.success_count;
+    } else if (IsTimeoutResult(result)) {
+      ++stats.timeout_count;
+    } else {
+      ++stats.failed_count;
+    }
+  }
+
+  co_return stats;
+}
+
+rpc::benchmark::BenchmarkResult RunBenchmark(const BenchmarkOptions& options) {
+  rpc::server::ServiceRegistry registry;
+  if (!registry.Register("BenchmarkService", "Echo",
+                         [](const std::string_view payload) {
+                           return std::string(payload);
+                         })) {
+    std::cerr << "failed to register benchmark method\n";
+    std::abort();
+  }
+
+  const std::size_t worker_count =
+      static_cast<std::size_t>(std::max(2, std::min(options.concurrency, 8)));
+  rpc::server::RpcServer server(options.port, registry, worker_count);
+
+  bool server_start_ok = false;
+  std::thread server_thread([&]() { server_start_ok = server.Start(); });
+
+  if (!WaitServerReady(options.port, std::chrono::seconds(2))) {
+    std::cerr << "benchmark server not ready\n";
+    std::abort();
+  }
+
+  rpc::benchmark::BenchmarkStats stats(
+      ModeToString(options.mode), options.concurrency, options.payload_bytes,
+      options.total_requests);
+
+  const std::string payload = BuildPayload(options.payload_bytes);
+  const int base = options.total_requests / options.concurrency;
+  const int rem = options.total_requests % options.concurrency;
+
+  std::vector<rpc::benchmark::LocalStats> locals(
+      static_cast<std::size_t>(options.concurrency));
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(options.concurrency));
+
+  const auto begin = std::chrono::steady_clock::now();
+  for (int i = 0; i < options.concurrency; ++i) {
+    const int request_count = base + ((i < rem) ? 1 : 0);
+    threads.emplace_back([&, i, request_count]() {
+      rpc::client::RpcClient client(
+          "127.0.0.1", options.port,
+          {.send_timeout = std::chrono::milliseconds(3000),
+           .recv_timeout = std::chrono::milliseconds(3000)});
+
+      if (options.mode == BenchMode::kSync) {
+        locals[static_cast<std::size_t>(i)] =
+            RunSyncWorker(&client, payload, request_count);
+        return;
+      }
+      if (options.mode == BenchMode::kAsync) {
+        locals[static_cast<std::size_t>(i)] =
+            RunAsyncWorker(&client, payload, request_count);
+        return;
+      }
+
+      locals[static_cast<std::size_t>(i)] = rpc::coroutine::SyncWait(
+          RunCoroutineWorker(&client, &payload, request_count));
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+  const auto end = std::chrono::steady_clock::now();
+
+  for (auto& local : locals) {
+    stats.Merge(std::move(local));
+  }
+
+  if (!server.Stop()) {
+    std::cerr << "failed to stop benchmark server\n";
+  }
+  server_thread.join();
+  if (!server_start_ok) {
+    std::cerr << "benchmark server start exited unexpectedly\n";
+  }
+
+  return stats.Finalize(begin, end);
+}
+
+void PrintUsage() {
+  std::cout << "usage: rpc_benchmark [--mode=sync|async|co] [--requests=N] "
+               "[--concurrency=N] [--payload_bytes=N] [--port=N] "
+               "[--output_dir=PATH]\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  const int iterations = (argc > 1) ? std::max(1, std::atoi(argv[1])) : 1000;
-
-  const pid_t pid = ::fork();
-  if (pid < 0) {
-    std::cerr << "fork failed\n";
+  BenchmarkOptions options;
+  if (!ParseArgs(argc, argv, &options)) {
+    PrintUsage();
     return 1;
   }
 
-  if (pid == 0) {
-    ::execl("./rpc_server_demo", "./rpc_server_demo", nullptr);
-    _exit(127);
+  const auto result = RunBenchmark(options);
+  rpc::benchmark::PrintBenchmarkResult(result);
+  rpc::benchmark::PrintBenchmarkCsv(result);
+
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  const std::string file_stem = "rpc_benchmark_" + result.mode + "_c" +
+                                std::to_string(result.concurrency) + "_p" +
+                                std::to_string(result.payload_bytes) + "_r" +
+                                std::to_string(result.total_requests) + "_" +
+                                std::to_string(now_ms);
+  std::string text_path;
+  std::string csv_path;
+  if (rpc::benchmark::WriteBenchmarkResultFiles(
+          result, options.output_dir, file_stem, &text_path, &csv_path)) {
+    std::cout << "result_text_file=" << text_path << '\n';
+    std::cout << "result_csv_file=" << csv_path << '\n';
+  } else {
+    std::cerr << "failed to write benchmark result files to "
+              << options.output_dir << '\n';
   }
-
-  if (!WaitServerReady(std::chrono::seconds(2))) {
-    ::kill(pid, SIGTERM);
-    ::waitpid(pid, nullptr, 0);
-    std::cerr << "benchmark failed: server not ready\n";
-    return 1;
-  }
-
-  rpc::client::RpcClient client(
-      "127.0.0.1", 50051,
-      {.send_timeout = std::chrono::milliseconds(3000),
-       .recv_timeout = std::chrono::milliseconds(3000)});
-
-  calc::AddRequest add_req;
-  add_req.set_a(1);
-  add_req.set_b(2);
-
-  std::string payload;
-  if (!add_req.SerializeToString(&payload)) {
-    std::cerr << "serialize request failed\n";
-    ::kill(pid, SIGTERM);
-    ::waitpid(pid, nullptr, 0);
-    return 1;
-  }
-
-  std::vector<long long> lat_us;
-  lat_us.reserve(static_cast<std::size_t>(iterations));
-
-  for (int i = 0; i < iterations; ++i) {
-    const auto t1 = std::chrono::steady_clock::now();
-    const auto res = client.Call("CalcService", "Add", payload);
-    const auto t2 = std::chrono::steady_clock::now();
-
-    if (!res.ok()) {
-      std::cerr << "rpc call failed at iteration " << i
-                << ", code=" << res.status.code.value()
-                << ", msg=" << res.status.message << '\n';
-      ::kill(pid, SIGTERM);
-      ::waitpid(pid, nullptr, 0);
-      return 1;
-    }
-
-    lat_us.push_back(
-        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
-  }
-
-  std::sort(lat_us.begin(), lat_us.end());
-  const long long sum_us = std::accumulate(lat_us.begin(), lat_us.end(), 0LL);
-  const double avg_us = static_cast<double>(sum_us) / lat_us.size();
-  const auto p95_idx = static_cast<std::size_t>(lat_us.size() * 0.95);
-  const long long p95_us = lat_us[std::min(p95_idx, lat_us.size() - 1)];
-  const double throughput_qps =
-      (1e6 * lat_us.size()) / static_cast<double>(sum_us);
-
-  std::cout << "RPC Benchmark (single connection)\n";
-  std::cout << "iterations=" << iterations << '\n';
-  std::cout << "avg_latency_us=" << avg_us << '\n';
-  std::cout << "p95_latency_us=" << p95_us << '\n';
-  std::cout << "throughput_qps=" << throughput_qps << '\n';
-
-  ::kill(pid, SIGTERM);
-  ::waitpid(pid, nullptr, 0);
-
   return 0;
 }

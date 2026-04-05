@@ -327,6 +327,7 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(rpc_benchmark
+    benchmarks/benchmark_stats.cpp
     benchmarks/rpc_benchmark.cpp
 )
 
@@ -337,6 +338,7 @@ target_link_libraries(rpc_benchmark
 )
 
 add_executable(rpc_thread_pool_benchmark
+    benchmarks/benchmark_stats.cpp
     benchmarks/rpc_thread_pool_benchmark.cpp
 )
 
