@@ -23,6 +23,7 @@ struct BenchmarkResult {
   double p50_latency_us{0.0};
   double p95_latency_us{0.0};
   double p99_latency_us{0.0};
+  long long max_latency_us{0};
 };
 
 struct LocalStats {

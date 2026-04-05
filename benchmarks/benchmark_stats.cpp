@@ -62,6 +62,7 @@ BenchmarkResult BenchmarkStats::Finalize(
     result.p50_latency_us = Percentile(latencies_us_, 0.50);
     result.p95_latency_us = Percentile(latencies_us_, 0.95);
     result.p99_latency_us = Percentile(latencies_us_, 0.99);
+    result.max_latency_us = latencies_us_.back();
   }
 
   return result;
@@ -110,6 +111,7 @@ std::string BenchmarkResultToText(const BenchmarkResult& result) {
   oss << "p50_latency_us=" << result.p50_latency_us << '\n';
   oss << "p95_latency_us=" << result.p95_latency_us << '\n';
   oss << "p99_latency_us=" << result.p99_latency_us << '\n';
+  oss << "max_latency_us=" << result.max_latency_us << '\n';
   return oss.str();
 }
 
@@ -120,7 +122,8 @@ std::string BenchmarkResultToCsv(const BenchmarkResult& result) {
       << result.failed_count << ',' << result.timeout_count << ','
       << result.total_time_ms << ',' << result.qps << ','
       << result.avg_latency_us << ',' << result.p50_latency_us << ','
-      << result.p95_latency_us << ',' << result.p99_latency_us;
+      << result.p95_latency_us << ',' << result.p99_latency_us << ','
+      << result.max_latency_us;
   return oss.str();
 }
 
@@ -156,7 +159,7 @@ bool WriteBenchmarkResultFiles(const BenchmarkResult& result,
     }
     out << "mode,concurrency,payload_bytes,total_requests,success_count,failed_"
            "count,timeout_count,total_time_ms,qps,avg_latency_us,p50_latency_"
-           "us,p95_latency_us,p99_latency_us\n";
+           "us,p95_latency_us,p99_latency_us,max_latency_us\n";
     out << BenchmarkResultToCsv(result) << '\n';
   }
 

@@ -12,3 +12,9 @@ Makefile
 *.a
 *.so
 *.out
+
+# Local tooling/cache folders
+.qwen/
+
+# Benchmark generated outputs
+benchmarks/results/

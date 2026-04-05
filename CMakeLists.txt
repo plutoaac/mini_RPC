@@ -347,3 +347,24 @@ target_link_libraries(rpc_thread_pool_benchmark
         rpc_framework
         Threads::Threads
 )
+
+add_executable(rpc_benchmark_pipeline
+    benchmarks/rpc_benchmark_pipeline.cpp
+)
+
+target_link_libraries(rpc_benchmark_pipeline
+    PRIVATE
+        rpc_framework
+        Threads::Threads
+)
+
+add_executable(rpc_benchmark_conn_pool
+    benchmarks/benchmark_stats.cpp
+    benchmarks/rpc_benchmark_conn_pool.cpp
+)
+
+target_link_libraries(rpc_benchmark_conn_pool
+    PRIVATE
+        rpc_framework
+        Threads::Threads
+)
