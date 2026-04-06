@@ -78,9 +78,10 @@
 #include <coroutine>  // std::coroutine_handle
 #include <cstddef>    // std::size_t
 #include <cstdint>
+#include <deque>  // std::deque
 #include <functional>
-#include <optional>   // std::optional
-#include <string>     // std::string
+#include <optional>  // std::optional
+#include <string>    // std::string
 #include <string_view>
 #include <thread>
 
@@ -532,8 +533,14 @@ class Connection {
    * @brief 写缓冲区
    *
    * 存储待发送的响应数据（已编码为帧格式）。
+   * 采用分块队列结构，避免部分发送时的内存搬移。
    */
-  std::string write_buffer_;
+  struct PendingChunk {
+    std::string data;
+    std::size_t offset{0};  // 记录已发送的字节数
+  };
+  std::deque<PendingChunk> write_buffer_;
+  std::size_t pending_write_bytes_{0};  // 记录待发送的总字节数
 
   std::string last_error_;
   State state_{State::kOpen};

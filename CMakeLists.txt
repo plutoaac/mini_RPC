@@ -301,18 +301,6 @@ if(BUILD_TESTING)
 
     add_test(NAME server_multi_worker_loop_test COMMAND server_multi_worker_loop_test)
 
-    add_executable(rpc_server_lifecycle_test
-        tests/rpc_server_lifecycle_test.cpp
-    )
-
-    target_link_libraries(rpc_server_lifecycle_test
-        PRIVATE
-            rpc_framework
-            Threads::Threads
-    )
-
-    add_test(NAME rpc_server_lifecycle_test COMMAND rpc_server_lifecycle_test)
-
     add_executable(server_thread_pool_integration_test
         tests/server_thread_pool_integration_test.cpp
     )

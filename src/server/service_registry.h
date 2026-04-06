@@ -45,8 +45,6 @@
  * @endcode
  *
  * @see Connection 使用 ServiceRegistry 处理请求
- * @author RPC Framework Team
- * @date 2024
  */
 
 #pragma once

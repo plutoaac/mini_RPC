@@ -89,10 +89,9 @@ Connection::Connection(rpc::common::UniqueFd fd,
 Connection::Connection(rpc::common::UniqueFd fd,
                        const ServiceRegistry& registry, Options options)
     : fd_(std::move(fd)), registry_(registry), options_(options) {
-  // 预分配缓冲区容量，减少后续扩容开销
-  // 8KB 是一个合理的初始大小，可以容纳大多数 RPC 请求/响应
+  // 预分配读缓冲区容量，减少后续扩容开销
   read_buffer_.reserve(8192);
-  write_buffer_.reserve(8192);
+  // 写缓冲区已改为分块队列 (deque)，不需要 reserve
 }
 
 // ============================================================================
@@ -1097,7 +1096,8 @@ bool Connection::QueueResponse(const rpc::RpcResponse& response,
     return false;
   }
 
-  const std::size_t next_size = write_buffer_.size() + frame.size();
+  // 背压检查：使用 pending_write_bytes_ 替代 write_buffer_.size()
+  const std::size_t next_size = pending_write_bytes_ + frame.size();
   if (next_size > options_.max_write_buffer_bytes) {
     if (error_msg != nullptr) {
       *error_msg = "write buffer backpressure limit exceeded";
@@ -1105,8 +1105,9 @@ bool Connection::QueueResponse(const rpc::RpcResponse& response,
     return false;
   }
 
-  // 加入写缓冲区
-  write_buffer_.append(frame);
+  // 加入写缓冲区（O(1) 操作）
+  pending_write_bytes_ += frame.size();
+  write_buffer_.push_back({std::move(frame), 0});
   return true;
 }
 
@@ -1116,17 +1117,24 @@ bool Connection::QueueResponse(const rpc::RpcResponse& response,
  * 非阻塞地发送尽可能多的数据。
  */
 bool Connection::FlushWrites(std::string* error_msg) {
-  std::size_t sent = 0;  // 已发送的字节数
+  while (!write_buffer_.empty()) {
+    auto& chunk = write_buffer_.front();
+    const std::size_t remaining = chunk.data.size() - chunk.offset;
 
-  while (sent < write_buffer_.size()) {
     // 尝试发送数据
     // MSG_NOSIGNAL：防止对端关闭时产生 SIGPIPE 信号
-    const ssize_t rc = ::send(fd_.Get(), write_buffer_.data() + sent,
-                              write_buffer_.size() - sent, MSG_NOSIGNAL);
+    const ssize_t rc = ::send(fd_.Get(), chunk.data.data() + chunk.offset,
+                              remaining, MSG_NOSIGNAL);
 
     if (rc > 0) {
-      // 成功发送数据
-      sent += static_cast<std::size_t>(rc);
+      // 成功发送了 rc 字节，更新游标
+      chunk.offset += static_cast<std::size_t>(rc);
+      pending_write_bytes_ -= static_cast<std::size_t>(rc);
+
+      // 如果当前块全部发完，弹出
+      if (chunk.offset == chunk.data.size()) {
+        write_buffer_.pop_front();
+      }
       continue;
     }
 
@@ -1145,10 +1153,6 @@ bool Connection::FlushWrites(std::string* error_msg) {
     return false;
   }
 
-  // 移除已发送的数据
-  if (sent > 0) {
-    write_buffer_.erase(0, sent);
-  }
   return true;
 }
 

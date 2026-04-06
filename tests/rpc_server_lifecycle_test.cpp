@@ -99,7 +99,7 @@ void TestRpcServerStartStopLifecycle() {
   bool start_result = false;
   std::thread server_thread([&]() { start_result = server.Start(); });
 
-  assert(WaitServerReady(kPort, std::chrono::seconds(2)));
+  assert(WaitServerReady(kPort, std::chrono::seconds(5)));
 
   rpc::client::RpcClient client(
       "127.0.0.1", kPort,

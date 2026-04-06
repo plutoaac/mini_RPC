@@ -14,6 +14,22 @@
 
 namespace rpc::client {
 
+/// 支持透明查找的哈希函数 (C++14/20 Transparent Lookup)
+struct StringHash {
+  using is_transparent = void;  // 启用透明比较的关键标识
+  std::size_t operator()(std::string_view sv) const {
+    return std::hash<std::string_view>{}(sv);
+  }
+};
+
+/// 支持透明查找的比较器
+struct StringEqual {
+  using is_transparent = void;  // 启用透明比较的关键标识
+  bool operator()(std::string_view lhs, std::string_view rhs) const {
+    return lhs == rhs;
+  }
+};
+
 /// RPC 调用请求管理器
 ///
 /// PendingCalls 用于管理进行中的 RPC 调用请求，维护 request_id
@@ -162,7 +178,9 @@ class PendingCalls {
   /// 互斥锁，保护 slots_ 的并发访问
   mutable std::mutex mutex_;
   /// 请求 ID -> 槽位的映射表
-  std::unordered_map<std::string, Slot> slots_;
+  /// 使用自定义 Hash 和 Equal 以支持 std::string_view
+  /// 透明查找，消除热路径上的临时 string 分配。
+  std::unordered_map<std::string, Slot, StringHash, StringEqual> slots_;
 };
 
 }  // namespace rpc::client

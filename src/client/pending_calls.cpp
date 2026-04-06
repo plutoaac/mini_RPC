@@ -7,7 +7,8 @@
 ///
 /// ### 改进 1：锁外恢复协程（Lock-Outside-Resume 模式）
 ///
-/// 在 Complete()、FailAll()、FailTimedOut() 中，采用"锁内摘句柄，锁外 resume"的模式：
+/// 在 Complete()、FailAll()、FailTimedOut() 中，采用"锁内摘句柄，锁外
+/// resume"的模式：
 /// - 在锁保护下取出 coroutine_handle，并立即解绑槽位
 /// - 释放锁后，再执行 coroutine_to_resume.resume()
 ///
@@ -79,7 +80,8 @@ bool PendingCalls::BindAsync(std::string_view request_id,
                              std::chrono::steady_clock::time_point deadline) {
   std::scoped_lock lock(mutex_);
 
-  const auto it = slots_.find(std::string(request_id));
+  // 直接使用 string_view 查找，利用透明比较器避免临时 string 分配
+  const auto it = slots_.find(request_id);
   if (it == slots_.end()) {
     return false;
   }
@@ -122,7 +124,8 @@ PendingCalls::BindCoroutineStatus PendingCalls::BindCoroutine(
     std::chrono::steady_clock::time_point deadline) {
   std::scoped_lock lock(mutex_);
 
-  const auto it = slots_.find(std::string(request_id));
+  // 直接使用 string_view 查找
+  const auto it = slots_.find(request_id);
   if (it == slots_.end()) {
     return BindCoroutineStatus::kNotFound;
   }
@@ -183,14 +186,15 @@ PendingCalls::BindCoroutineStatus PendingCalls::BindCoroutine(
 bool PendingCalls::Complete(std::string_view request_id, RpcCallResult result) {
   // === 声明锁外使用的变量 ===
   std::coroutine_handle<> coroutine_to_resume;  // 待恢复的协程句柄
-  std::optional<std::promise<RpcCallResult>> async_promise;  // 待完成的异步 promise
+  std::optional<std::promise<RpcCallResult>>
+      async_promise;           // 待完成的异步 promise
   RpcCallResult async_result;  // 异步结果
 
   {
     std::scoped_lock lock(mutex_);
 
-    // 查找对应的槽位
-    const auto it = slots_.find(std::string(request_id));
+    // 查找对应的槽位，直接使用 string_view
+    const auto it = slots_.find(request_id);
     if (it == slots_.end()) {
       // 请求不存在，可能已超时被移除
       return false;
@@ -223,7 +227,8 @@ bool PendingCalls::Complete(std::string_view request_id, RpcCallResult result) {
       coroutine_to_resume = slot.coroutine_handle;
       slot.coroutine_bound = false;
       slot.coroutine_handle = {};
-      // 注意：此时不删除槽位，因为协程恢复后会在 await_resume 中调用 TryPop 取结果
+      // 注意：此时不删除槽位，因为协程恢复后会在 await_resume 中调用 TryPop
+      // 取结果
     } else {
       // 同步等待模式：唤醒阻塞在 WaitAndPop 的线程
       slot.cv.notify_all();
@@ -259,8 +264,8 @@ std::optional<RpcCallResult> PendingCalls::WaitAndPop(
     std::string_view request_id, std::chrono::milliseconds timeout) {
   std::unique_lock lock(mutex_);
 
-  const auto key = std::string(request_id);
-  auto it = slots_.find(key);
+  // 直接使用 string_view 查找
+  auto it = slots_.find(request_id);
   if (it == slots_.end()) {
     // 请求不存在
     return std::nullopt;
@@ -277,8 +282,8 @@ std::optional<RpcCallResult> PendingCalls::WaitAndPop(
       // 超时返回空
       return std::nullopt;
     }
-    // 被唤醒后重新查找，因为槽位可能在等待期间被删除
-    it = slots_.find(key);
+    // 被唤醒后重新查找
+    it = slots_.find(request_id);
     if (it == slots_.end()) {
       return std::nullopt;
     }
@@ -302,7 +307,8 @@ std::optional<RpcCallResult> PendingCalls::WaitAndPop(
 std::optional<RpcCallResult> PendingCalls::TryPop(std::string_view request_id) {
   std::scoped_lock lock(mutex_);
 
-  const auto it = slots_.find(std::string(request_id));
+  // 直接使用 string_view 查找
+  const auto it = slots_.find(request_id);
 
   // 检查是否存在且已完成
   if (it == slots_.end() || !it->second.done) {
@@ -323,7 +329,11 @@ std::optional<RpcCallResult> PendingCalls::TryPop(std::string_view request_id) {
 /// @note 如果有线程正在等待该请求，删除后等待会返回 nullopt
 void PendingCalls::Remove(std::string_view request_id) {
   std::scoped_lock lock(mutex_);
-  slots_.erase(std::string(request_id));
+  // C++20 中 erase 不支持直接传 heterogeneous key，先 find 再 erase 迭代器
+  auto it = slots_.find(request_id);
+  if (it != slots_.end()) {
+    slots_.erase(it);
+  }
 }
 
 /// 将所有待处理请求标记为失败
