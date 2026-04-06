@@ -51,6 +51,18 @@ bool SetSocketTimeout(int fd, int optname, std::chrono::milliseconds timeout,
   return true;
 }
 
+/// @brief 判断读取错误是否为临时/可恢复错误
+/// @param read_error 错误描述字符串
+/// @return 如果是临时错误返回 true，否则返回 false
+///
+/// 在非阻塞 I/O (MSG_DONTWAIT) 或设置了接收超时 (SO_RCVTIMEO) 的场景下，
+/// recv() 失败不一定代表连接断开。
+/// - "Resource temporarily unavailable": 对应
+/// EAGAIN/EWOULDBLOCK，表示当前无数据可读，等待下一次 epoll 事件即可。
+/// - "recv timeout": 对应 SO_RCVTIMEO
+/// 超时，表示在指定时间内无数据，连接依然存活。
+///
+/// 其他错误（如 "Connection reset by peer"）则视为致命错误，通常需要关闭连接。
 bool IsTemporaryReadFailure(std::string_view read_error) {
   return read_error.find("Resource temporarily unavailable") !=
              std::string_view::npos ||
