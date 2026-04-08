@@ -386,6 +386,96 @@ class Connection {
   // =========================================================================
 
   /**
+   * @class Buffer
+   * @brief 连续内存读缓冲区（Muduo Buffer 风格）
+   *
+   * 使用读写双游标避免频繁 erase(0, offset) 导致的 O(N) memmove。
+   * 消费数据时仅移动 read_index_（O(1)），仅在尾部空间不足时 compact。
+   *
+   * 内存布局：
+   *   [prependable][   readable   ][  writable  ]
+   *   [0        ... read_i][read_i ... write_i][write_i ... end]
+   *
+   * 可读区间为 [read_index_, write_index_)，保证连续。
+   */
+  class Buffer {
+   public:
+    explicit Buffer(std::size_t initial_capacity = 8192)
+        : buffer_(initial_capacity), read_index_(0), write_index_(0) {}
+
+    // 不可拷贝，可移动
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+    Buffer(Buffer&&) noexcept = default;
+    Buffer& operator=(Buffer&&) noexcept = default;
+
+    // ---- 查询接口 ----
+    [[nodiscard]] std::size_t readable_bytes() const noexcept {
+      return write_index_ - read_index_;
+    }
+    [[nodiscard]] std::size_t writable_bytes() const noexcept {
+      return buffer_.size() - write_index_;
+    }
+    [[nodiscard]] std::size_t prependable_bytes() const noexcept {
+      return read_index_;
+    }
+
+    // ---- 读接口 ----
+    /// 返回当前可读数据起始地址（保证连续）
+    [[nodiscard]] const char* peek() const noexcept {
+      return begin() + read_index_;
+    }
+
+    /// 消费 n 字节，仅移动游标 O(1)
+    void retrieve(std::size_t n) noexcept {
+      read_index_ += n;
+      // 如果全部消费完，重置游标到初始位置
+      if (read_index_ == write_index_) {
+        read_index_ = 0;
+        write_index_ = 0;
+      }
+    }
+
+    /// 消费全部可读数据
+    void retrieve_all() noexcept { retrieve(readable_bytes()); }
+
+    /// 以 string_view 形式返回可读数据（零拷贝，注意生命周期）
+    [[nodiscard]] std::string_view peek_string_view() const noexcept {
+      return {peek(), readable_bytes()};
+    }
+
+    // ---- 写接口 ----
+    /// 返回当前可写起始地址
+    [[nodiscard]] char* begin_write() noexcept {
+      return begin() + write_index_;
+    }
+    [[nodiscard]] const char* begin_write() const noexcept {
+      return begin() + write_index_;
+    }
+
+    /// 告知已写入 n 字节，推进 write_index_
+    void has_written(std::size_t n) noexcept { write_index_ += n; }
+
+    /// 追加数据，必要时 compact 或扩容
+    void append(const char* data, std::size_t len);
+    void append(std::string_view data) { append(data.data(), data.size()); }
+
+   private:
+    [[nodiscard]] char* begin() noexcept { return buffer_.data(); }
+    [[nodiscard]] const char* begin() const noexcept { return buffer_.data(); }
+
+    /// 将 [read_index_, write_index_) 的未消费数据搬到头部
+    void compact();
+
+    /// 确保尾部至少有 len 字节可写空间
+    void ensure_writable(std::size_t len);
+
+    std::vector<char> buffer_;
+    std::size_t read_index_{0};
+    std::size_t write_index_{0};
+  };
+
+  /**
    * @enum ReadResult
    * @brief socket 读取结果枚举
    *
@@ -482,15 +572,13 @@ class Connection {
   /**
    * @brief 解码帧头（读取长度前缀）
    *
-   * @param buffer 缓冲区数据
-   * @param offset 在缓冲区中的偏移量
+   * @param data 帧数据起始指针（已跳过已消费字节）
    * @param body_length 输出的帧体长度
    * @param error_msg 如果失败，输出错误信息
    * @return true 解码成功
    * @return false 帧头无效
    */
-  [[nodiscard]] static bool DecodeFrameHeader(const std::string& buffer,
-                                              std::size_t offset,
+  [[nodiscard]] static bool DecodeFrameHeader(const char* data,
                                               std::size_t* body_length,
                                               std::string* error_msg);
 
@@ -526,8 +614,10 @@ class Connection {
    * @brief 读缓冲区
    *
    * 存储从 socket 接收但尚未处理的原始数据。
+   * 采用读写双游标设计，消费数据时仅移动 read_index_（O(1)），
+   * 仅在尾部空间不足时才 compact（memmove 未消费数据到头部）。
    */
-  std::string read_buffer_;
+  Buffer read_buffer_;
 
   /**
    * @brief 写缓冲区

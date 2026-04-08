@@ -45,6 +45,7 @@
 #include <string_view>  // std::string_view
 #include <thread>
 #include <utility>
+#include <vector>  // std::vector
 
 #include "common/log.h"               // 日志输出
 #include "common/rpc_error.h"         // RPC 错误定义
@@ -64,6 +65,9 @@ constexpr std::size_t kFrameHeaderBytes = 4;
 
 /// 最大帧大小限制（4MB），防止恶意客户端发送超大帧
 constexpr std::size_t kMaxFrameSize = 4 * 1024 * 1024;
+
+/// 保留服务名：用于应用层心跳探测（与客户端约定）
+inline constexpr std::string_view kHeartbeatServiceName = "__Heartbeat__";
 
 }  // namespace
 
@@ -88,10 +92,11 @@ Connection::Connection(rpc::common::UniqueFd fd,
 
 Connection::Connection(rpc::common::UniqueFd fd,
                        const ServiceRegistry& registry, Options options)
-    : fd_(std::move(fd)), registry_(registry), options_(options) {
-  // 预分配读缓冲区容量，减少后续扩容开销
-  read_buffer_.reserve(8192);
-  // 写缓冲区已改为分块队列 (deque)，不需要 reserve
+    : fd_(std::move(fd)),
+      registry_(registry),
+      options_(options),
+      read_buffer_(8192) {
+  // Buffer 构造函数已预分配 8192 字节
 }
 
 // ============================================================================
@@ -877,40 +882,31 @@ bool Connection::Serve() {
  * 循环读取直到没有更多数据或发生错误。
  */
 Connection::ReadResult Connection::ReadFromSocket(std::string* error_msg) {
-  char chunk[4096];  // 每次读取的块大小
+  char chunk[4096];
 
   while (true) {
-    // 尝试读取数据
-    const ssize_t rc =
-        ::recv(fd_.Get(), chunk, static_cast<std::size_t>(sizeof(chunk)), 0);
+    const ssize_t rc = ::recv(fd_.Get(), chunk, sizeof(chunk), 0);
 
     if (rc > 0) {
-      // 成功读取数据，追加到读缓冲区
       read_buffer_.append(chunk, static_cast<std::size_t>(rc));
-      // 继续循环读取更多数据，直到 EAGAIN/EWOULDBLOCK 或对端关闭
       continue;
     }
 
     if (rc == 0) {
-      // 返回 0 表示对端关闭连接
       if (error_msg != nullptr) {
         *error_msg = "peer closed connection";
       }
       return ReadResult::kPeerClosed;
     }
 
-    // rc < 0：发生错误
     if (errno == EINTR) {
-      // 被信号中断，重试
       continue;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // 非阻塞模式：没有更多数据可读
-      // 如果已经读取了数据，返回 kData 表示有数据被读取
-      return read_buffer_.empty() ? ReadResult::kWouldBlock : ReadResult::kData;
+      return read_buffer_.readable_bytes() == 0 ? ReadResult::kWouldBlock
+                                                : ReadResult::kData;
     }
 
-    // 其他错误
     if (error_msg != nullptr) {
       *error_msg = std::string("recv failed: ") + std::strerror(errno);
     }
@@ -928,24 +924,23 @@ Connection::ReadResult Connection::ReadFromSocket(std::string* error_msg) {
  * 循环解析缓冲区中所有完整的帧。
  */
 bool Connection::TryParseRequests(std::string* error_msg) {
-  std::size_t offset = 0;  // 当前解析位置
-
-  // 循环处理缓冲区中所有完整的帧
-  while (read_buffer_.size() - offset >= kFrameHeaderBytes) {
+  // 循环处理缓冲区中所有完整的帧。
+  // peek() 始终指向当前可读数据的起始位置（连续内存）。
+  while (read_buffer_.readable_bytes() >= kFrameHeaderBytes) {
     // 解析帧头获取帧体长度
     std::size_t body_length = 0;
-    if (!DecodeFrameHeader(read_buffer_, offset, &body_length, error_msg)) {
+    if (!DecodeFrameHeader(read_buffer_.peek(), &body_length, error_msg)) {
       return false;  // 帧头无效，关闭连接
     }
 
     // 检查是否已接收完整的帧体
-    if (read_buffer_.size() - offset < kFrameHeaderBytes + body_length) {
+    if (read_buffer_.readable_bytes() < kFrameHeaderBytes + body_length) {
       // 帧体不完整，等待更多数据
       break;
     }
 
-    // 提取帧体
-    std::string_view body_view(read_buffer_.data() + offset + kFrameHeaderBytes,
+    // 提取帧体（从 peek() + 帧头 开始，保证连续）
+    std::string_view body_view(read_buffer_.peek() + kFrameHeaderBytes,
                                body_length);
 
     // 解析并处理请求
@@ -961,8 +956,20 @@ bool Connection::TryParseRequests(std::string* error_msg) {
       if (!EnqueueResponse(response, error_msg)) {
         return false;
       }
+      // 消费掉整个帧（帧头 + 帧体）
+      read_buffer_.retrieve(kFrameHeaderBytes + body_length);
     } else {
-      if (request_dispatcher_) {
+      // 心跳请求快速路径：不进线程池、不进服务注册表，直接返回空响应。
+      if (request.service_name() == kHeartbeatServiceName) {
+        rpc::RpcResponse hb_response;
+        hb_response.set_request_id(request.request_id());
+        hb_response.set_error_code(rpc::OK);
+        // 空 payload，最小化网络开销
+        if (!EnqueueResponse(hb_response, error_msg)) {
+          return false;
+        }
+        read_buffer_.retrieve(kFrameHeaderBytes + body_length);
+      } else if (request_dispatcher_) {
         DispatchRequest dispatch;
         dispatch.sequence = ++next_request_sequence_;
         dispatch.request_id = request.request_id();
@@ -975,6 +982,7 @@ bool Connection::TryParseRequests(std::string* error_msg) {
           }
           return false;
         }
+        read_buffer_.retrieve(kFrameHeaderBytes + body_length);
       } else {
         // 解析成功：处理请求
         if (!HandleOneRequest(request, &response)) {
@@ -986,16 +994,9 @@ bool Connection::TryParseRequests(std::string* error_msg) {
         if (!EnqueueResponse(response, error_msg)) {
           return false;
         }
+        read_buffer_.retrieve(kFrameHeaderBytes + body_length);
       }
     }
-
-    // 移动到下一个帧
-    offset += kFrameHeaderBytes + body_length;
-  }
-
-  // 移除已处理的数据
-  if (offset > 0) {
-    read_buffer_.erase(0, offset);
   }
 
   return true;
@@ -1157,6 +1158,45 @@ bool Connection::FlushWrites(std::string* error_msg) {
 }
 
 // ============================================================================
+// Buffer 实现
+// ============================================================================
+
+void Connection::Buffer::append(const char* data, std::size_t len) {
+  ensure_writable(len);
+  std::memcpy(begin() + write_index_, data, len);
+  write_index_ += len;
+}
+
+void Connection::Buffer::compact() {
+  if (read_index_ == 0) {
+    return;  // 已在头部，无需搬移
+  }
+  const std::size_t readable = write_index_ - read_index_;
+  if (readable > 0) {
+    std::memmove(begin(), begin() + read_index_, readable);
+  }
+  write_index_ = readable;
+  read_index_ = 0;
+}
+
+void Connection::Buffer::ensure_writable(std::size_t len) {
+  if (writable_bytes() >= len) {
+    return;  // 尾部空间足够
+  }
+
+  // 尾部空间不够，不管是否需要真正扩容，都先把存留数据挪到最前面
+  // 这样能最大化利用现有容量，也能统一游标坐标
+  compact();
+
+  // 如果 compact 之后，后面的可写空间还是不够，就只能扩容了
+  if (writable_bytes() < len) {
+    // 注意扩容后整体 size 的设定：现有数据的大小 (write_index_) +
+    // 新数据需要的长度 (len)
+    buffer_.resize(write_index_ + len);
+  }
+}
+
+// ============================================================================
 // 静态辅助方法实现 - 帧编解码
 // ============================================================================
 
@@ -1200,10 +1240,8 @@ bool Connection::EncodeFrame(const std::string& body, std::string* frame,
  *
  * 从缓冲区中读取 4 字节大端序长度前缀。
  */
-bool Connection::DecodeFrameHeader(const std::string& buffer,
-                                   std::size_t offset, std::size_t* body_length,
+bool Connection::DecodeFrameHeader(const char* data, std::size_t* body_length,
                                    std::string* error_msg) {
-  // 参数检查
   if (body_length == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "body_length is null";
@@ -1211,12 +1249,10 @@ bool Connection::DecodeFrameHeader(const std::string& buffer,
     return false;
   }
 
-  // 读取大端序长度并转换为主机字节序
   std::uint32_t be_length = 0;
-  std::memcpy(&be_length, buffer.data() + offset, kFrameHeaderBytes);
+  std::memcpy(&be_length, data, kFrameHeaderBytes);
   const std::uint32_t parsed = ntohl(be_length);
 
-  // 长度有效性检查
   if (parsed == 0 || parsed > kMaxFrameSize) {
     if (error_msg != nullptr) {
       *error_msg = "invalid request frame length";
