@@ -23,6 +23,7 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
 add_library(rpc_framework
     ${PROTO_SRCS}
     src/protocol/codec.cpp
+    src/common/log.cpp
     src/common/thread_pool.cpp
     src/server/service_registry.cpp
     src/server/connection.cpp
@@ -43,6 +44,7 @@ target_include_directories(rpc_framework
 target_link_libraries(rpc_framework
     PUBLIC
         ${Protobuf_LIBRARIES}
+    Threads::Threads
 )
 
 add_executable(rpc_server_demo
@@ -312,6 +314,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME server_thread_pool_integration_test COMMAND server_thread_pool_integration_test)
+
+    add_executable(heartbeat_test
+        tests/heartbeat_test.cpp
+    )
+
+    target_link_libraries(heartbeat_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME heartbeat_test COMMAND heartbeat_test)
 endif()
 
 add_executable(rpc_benchmark

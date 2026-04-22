@@ -26,6 +26,10 @@ struct RpcClientOptions {
   std::chrono::milliseconds send_timeout{2000};
   /// 接收超时时间（毫秒），默认 2000ms
   std::chrono::milliseconds recv_timeout{2000};
+  /// 心跳发送间隔（秒），默认 30s。设为 0 则禁用心跳。
+  std::chrono::seconds heartbeat_interval{30};
+  /// 心跳超时关闭间隔（秒），默认 45s。设为 0 则禁用心跳。
+  std::chrono::seconds heartbeat_timeout{45};
 };
 
 /// 阻塞式 RPC 客户端
@@ -105,6 +109,10 @@ class RpcClient {
   /// @return 字符串形式的请求 ID
   [[nodiscard]] std::string NextRequestId();
 
+  /// 发送心跳请求（空请求，service_name="__Heartbeat__"）
+  /// 必须在 dispatcher 线程中调用（持有 write_mu_）
+  void SendHeartbeatRequest();
+
   void DispatcherLoop();
 
   /// 服务器地址
@@ -123,6 +131,9 @@ class RpcClient {
   /// 下一个请求 ID，原子变量保证线程安全的递增
   std::atomic<std::uint64_t> next_id_;
   std::shared_ptr<PendingCalls> pending_calls_;
+
+  /// 最近一次从服务端收到任何数据的时间点（用于心跳检测）
+  std::chrono::steady_clock::time_point last_activity_time_;
 };
 
 }  // namespace rpc::client

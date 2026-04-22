@@ -72,8 +72,20 @@ bool IsTemporaryReadFailure(std::string_view read_error) {
 constexpr std::size_t kFrameHeaderBytes = 4;
 constexpr std::size_t kMaxFrameSize = 4 * 1024 * 1024;
 
+/// 保留服务名：用于应用层心跳探测
+inline constexpr std::string_view kHeartbeatServiceName = "__Heartbeat__";
+
+/// 超过多久没收到数据就发送心跳请求
+inline constexpr std::chrono::seconds kHeartbeatSendInterval{30};
+
+/// 超过多久没收到数据就认为连接失活
+inline constexpr std::chrono::seconds kHeartbeatTimeout{45};
+
 bool HandleReadableFrames(std::string* read_buffer,
-                          const std::shared_ptr<PendingCalls>& pending_calls) {
+                          const std::shared_ptr<PendingCalls>& pending_calls,
+                          std::chrono::steady_clock::time_point* last_activity,
+                          int fd, std::mutex* write_mu,
+                          const std::atomic<std::uint64_t>* next_id) {
   // 允许一次网络读取携带多帧响应：循环尽量解析完整帧，剩余半包留在缓冲区。
   std::size_t offset = 0;
 
@@ -106,19 +118,27 @@ bool HandleReadableFrames(std::string* read_buffer,
       return false;
     }
 
-    const RpcCallResult mapped_result{
-        {common::FromProtoErrorCode(response.error_code()),
-         response.error_msg()},
-        response.payload()};
-    if (!pending_calls->Complete(response.request_id(), mapped_result)) {
-      common::LogWarn("response request_id not found in pending table: " +
-                      response.request_id());
+    // 心跳响应特判：不走 pending_calls_ 完成路径。
+    if (response.request_id().rfind("hb_", 0) == 0) {
+      // 心跳 ACK，仅记录日志，不做任何业务处理。
+      common::LogInfo("heartbeat ack received");
+    } else {
+      const RpcCallResult mapped_result{
+          {common::FromProtoErrorCode(response.error_code()),
+           response.error_msg()},
+          response.payload()};
+      if (!pending_calls->Complete(response.request_id(), mapped_result)) {
+        common::LogWarn("response request_id not found in pending table: " +
+                        response.request_id());
+      }
     }
 
     offset += kFrameHeaderBytes + static_cast<std::size_t>(body_length);
   }
 
   if (offset > 0) {
+    // 收到任何有效数据都刷新活跃时间。
+    *last_activity = std::chrono::steady_clock::now();
     read_buffer->erase(0, offset);
   }
   return true;
@@ -381,6 +401,29 @@ std::string RpcClient::NextRequestId() {
   return std::to_string(id);
 }
 
+/// 发送心跳请求
+/// 在 dispatcher 线程中调用（由 DispatcherLoop 的 timeout tick 触发）
+void RpcClient::SendHeartbeatRequest() {
+  rpc::RpcRequest request;
+  request.set_request_id("hb_" + std::to_string(++next_id_));
+  request.set_service_name(std::string(kHeartbeatServiceName));
+  request.set_method_name("Ping");
+  request.clear_payload();
+
+  std::string write_error;
+  {
+    std::scoped_lock write_lock(write_mu_);
+    if (!sock_ ||
+        !protocol::Codec::WriteMessage(sock_.Get(), request, &write_error)) {
+      common::LogError("heartbeat send failed: " +
+                       (write_error.empty() ? std::string("connection closed")
+                                            : write_error));
+      return;
+    }
+  }
+  common::LogInfo("heartbeat sent");
+}
+
 /// 通用 RPC 异步调用接口
 ///
 /// 执行一次完整的 RPC 调用流程：建立连接 → 发送请求 → 异步等待响应。
@@ -506,7 +549,7 @@ rpc::coroutine::Task<RpcCallResult> RpcClient::CallCo(
 /// 1. 等待 socket 可读或 tick 超时
 /// 2. 可读时读取并解析长度前缀帧
 /// 3. 根据 response.request_id 完成 pending call
-/// 4. tick 时触发按请求超时清理
+/// 4. tick 时触发按请求超时清理 + 心跳检测
 void RpcClient::DispatcherLoop() {
   int fd = -1;
   {
@@ -547,17 +590,53 @@ void RpcClient::DispatcherLoop() {
   std::string read_buffer;
   read_buffer.reserve(8192);
 
-  // reactor 主循环：事件等待 + 读取解析 + request_id 分发 + 超时清理。
+  // 初始化活跃时间：连接建立时
+  last_activity_time_ = std::chrono::steady_clock::now();
+  auto last_heartbeat_time_ = last_activity_time_;
+
+  // reactor 主循环：事件等待 + 读取解析 + request_id 分发 + 超时清理 +
+  // 心跳检测。
   while (dispatcher_running_.load()) {
     switch (local_loop->WaitOnce(50)) {
-      case EventLoop::WaitResult::kTimeout:
+      case EventLoop::WaitResult::kTimeout: {
+        const auto now = std::chrono::steady_clock::now();
+
+        // 先做业务请求的超时清理
         pending_calls_->FailTimedOut(
-            std::chrono::steady_clock::now(),
+            now,
             RpcCallResult{
                 {common::make_error_code(common::ErrorCode::kInternalError),
                  "call timeout"},
                 {}});
+
+        // 心跳检测（heartbeat_interval/timeout 为 0 则禁用）
+        if (options_.heartbeat_timeout.count() > 0) {
+          const auto idle = now - last_activity_time_;
+          if (idle >= options_.heartbeat_timeout) {
+            // 超过阈值没收到任何数据 → 认为连接失活
+            common::LogError("connection inactive for " +
+                             std::to_string(idle.count()) + "us, closing");
+            pending_calls_->FailAll(RpcCallResult{
+                {common::make_error_code(common::ErrorCode::kInternalError),
+                 "connection inactive (heartbeat timeout)"},
+                {}});
+            dispatcher_running_.store(false);
+            break;
+          }
+        }
+        if (options_.heartbeat_interval.count() > 0) {
+          if (now - last_activity_time_ >= options_.heartbeat_interval) {
+            // Check if we already sent a heartbeat recently
+            if (now - last_heartbeat_time_ >= options_.heartbeat_interval) {
+              // 超过阈值没收到数据 → 发送心跳探测
+              SendHeartbeatRequest();
+              // 记录心跳发送时间，避免风暴
+              last_heartbeat_time_ = now;
+            }
+          }
+        }
         break;
+      }
       case EventLoop::WaitResult::kWakeup:
         break;
       case EventLoop::WaitResult::kError:
@@ -576,6 +655,8 @@ void RpcClient::DispatcherLoop() {
           const ssize_t rc = ::recv(fd, chunk, sizeof(chunk), MSG_DONTWAIT);
           if (rc > 0) {
             read_buffer.append(chunk, static_cast<std::size_t>(rc));
+            // 收到任何原始数据都刷新活跃时间
+            last_activity_time_ = std::chrono::steady_clock::now();
             continue;
           }
           if (rc == 0) {
@@ -609,13 +690,15 @@ void RpcClient::DispatcherLoop() {
           break;
         }
 
-        if (!HandleReadableFrames(&read_buffer, pending_calls_)) {
+        if (!HandleReadableFrames(&read_buffer, pending_calls_,
+                                  &last_activity_time_, fd, &write_mu_,
+                                  &next_id_)) {
           dispatcher_running_.store(false);
           break;
         }
 
         if (peer_closed) {
-          // 先解析已读缓存，再对仍未完成请求做失败收敛，避免“先到响应被覆盖”。
+          // 先解析已读缓存，再对仍未完成请求做失败收敛，避免"先到响应被覆盖"。
           if (pending_calls_->Size() > 0) {
             pending_calls_->FailAll(RpcCallResult{
                 {common::make_error_code(common::ErrorCode::kInternalError),

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <iostream>
 #include <source_location>
+#include <string>
 #include <string_view>
 
 namespace rpc::common {
@@ -35,17 +35,17 @@ enum class LogLevel {
   return base;
 }
 
-inline void Log(
-    LogLevel level, std::string_view message,
-    const std::source_location& location = std::source_location::current()) {
-  std::ostream& os = (level == LogLevel::kError)
-                         ? static_cast<std::ostream&>(std::cerr)
-                         : static_cast<std::ostream&>(std::cout);
+// Phase 1: async file logger with mutex + condition_variable queue.
+// These controls are optional for callers and keep existing call sites
+// unchanged.
+void SetLogFile(std::string_view path);
+void FlushLogger();
+void ShutdownLogger();
+void StopLogger();
 
-  os << '[' << LogLevelName(level) << "] " << Basename(location.file_name())
-     << ':' << location.line() << " " << location.function_name() << " | "
-     << message << '\n';
-}
+void Log(
+    LogLevel level, std::string_view message,
+    const std::source_location& location = std::source_location::current());
 
 inline void LogInfo(
     std::string_view message,
