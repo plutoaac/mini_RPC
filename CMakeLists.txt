@@ -23,6 +23,7 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
 add_library(rpc_framework
     ${PROTO_SRCS}
     src/protocol/codec.cpp
+    src/common/async_logger.cpp
     src/common/log.cpp
     src/common/thread_pool.cpp
     src/server/service_registry.cpp
@@ -366,6 +367,16 @@ add_executable(rpc_benchmark_conn_pool
 )
 
 target_link_libraries(rpc_benchmark_conn_pool
+    PRIVATE
+        rpc_framework
+        Threads::Threads
+)
+
+add_executable(async_logger_benchmark
+    benchmarks/async_logger_benchmark.cpp
+)
+
+target_link_libraries(async_logger_benchmark
     PRIVATE
         rpc_framework
         Threads::Threads
