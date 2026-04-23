@@ -23,18 +23,25 @@ enum class DropPolicy : std::uint8_t {
 
 struct LoggerOptions {
   std::filesystem::path log_file_path{"./rpc.log"};
-  std::size_t queue_capacity{1u << 18};
-  std::size_t max_batch_size{1024};
+  std::size_t queue_capacity{1u << 16};
+  std::size_t max_batch_size{512};
   std::chrono::milliseconds flush_interval{500};
-  std::uint32_t spin_before_sleep{256};
-  std::chrono::microseconds idle_sleep{50};
+  std::uint32_t spin_before_sleep{128};
+  std::chrono::microseconds idle_sleep{150};
   DropPolicy drop_policy{DropPolicy::DropNewest};
   LogLevel min_level{LogLevel::kInfo};
-  std::size_t inline_message_capacity{112};
+  // Threshold for choosing inline vs heap message storage.
+  std::size_t inline_message_threshold{112};
 
   // Compatibility field for older call sites.
   std::string file_path{};
 };
+
+// Preset focused on peak throughput and lower drop rate under bursts.
+[[nodiscard]] LoggerOptions ThroughputFirstLoggerOptions();
+
+// Preset focused on balanced CPU usage, drop rate, and shutdown latency.
+[[nodiscard]] LoggerOptions BalancedLoggerOptions();
 
 struct LoggerRuntimeStats {
   std::uint64_t submit_calls{0};

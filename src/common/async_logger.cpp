@@ -25,10 +25,10 @@ namespace rpc::common::detail {
 namespace {
 
 constexpr std::size_t kRingCapacity = 1u << 18;
-constexpr std::size_t kDefaultQueueCapacity = 1u << 18;
-constexpr std::size_t kDefaultBatchSize = 1024;
+constexpr std::size_t kDefaultQueueCapacity = 1u << 16;
+constexpr std::size_t kDefaultBatchSize = 512;
 constexpr std::chrono::milliseconds kDefaultFlushInterval{500};
-constexpr std::chrono::microseconds kDefaultIdleSleep{50};
+constexpr std::chrono::microseconds kDefaultIdleSleep{150};
 constexpr std::chrono::milliseconds kDropSummaryInterval{500};
 constexpr std::size_t kDefaultInlineMessageCapacity = 112;
 constexpr std::string_view kDefaultLogFilePath = "./rpc.log";
@@ -176,6 +176,12 @@ class AsyncLoggerEngine final {
   ~AsyncLoggerEngine() { Shutdown(); }
 
   void Init(const LoggerOptions& options) {
+    // Current singleton lifecycle is one-shot: Shutdown() is terminal.
+    // Restart semantics are intentionally not implemented in phase 2.5.
+    if (!accepting_logs_.load(std::memory_order_acquire)) {
+      return;
+    }
+
     SetLogLevel(options.min_level);
 
     queue_capacity_soft_.store(
@@ -189,13 +195,13 @@ class AsyncLoggerEngine final {
     spin_before_sleep_.store(
         std::max<std::uint32_t>(1, options.spin_before_sleep),
         std::memory_order_release);
-    idle_sleep_ns_.store(
+    idle_sleep_us_.store(
         std::max<std::int64_t>(0, options.idle_sleep.count()),
         std::memory_order_release);
-    inline_message_capacity_.store(
-        std::max<std::size_t>(1,
-                              std::min(options.inline_message_capacity,
-                                       SmallLogMessage::kInlineCapacity)),
+    inline_message_threshold_.store(
+      std::max<std::size_t>(1,
+                  std::min(options.inline_message_threshold,
+                       SmallLogMessage::kInlineCapacity)),
         std::memory_order_release);
     drop_policy_.store(options.drop_policy, std::memory_order_release);
 
@@ -260,8 +266,10 @@ class AsyncLoggerEngine final {
     const std::size_t soft_cap = queue_capacity_soft_.load(std::memory_order_relaxed);
     if (soft_cap < kRingCapacity &&
       inflight_count_.load(std::memory_order_relaxed) >= soft_cap) {
-      // DropOldest is intentionally mapped to DropNewest in this phase because
-      // lock-free MPSC fast path should not mutate old slots.
+      // Phase 2.5 semantics: DropOldest is reserved for future expansion.
+      // In current lock-free MPSC fast path, both policies behave as DropNewest.
+      const DropPolicy policy = drop_policy_.load(std::memory_order_relaxed);
+      (void)policy;
       dropped_.fetch_add(1, std::memory_order_relaxed);
       dropped_for_summary_.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -279,7 +287,7 @@ class AsyncLoggerEngine final {
       entry.function_name = location.function_name();
       // Phase 2 core change: producer captures structured fields only.
       entry.message.Assign(
-          message, inline_message_capacity_.load(std::memory_order_relaxed));
+          message, inline_message_threshold_.load(std::memory_order_relaxed));
     } catch (...) {
       dropped_.fetch_add(1, std::memory_order_relaxed);
       dropped_for_summary_.fetch_add(1, std::memory_order_relaxed);
@@ -423,9 +431,9 @@ class AsyncLoggerEngine final {
       }
 
       if (!has_work) {
-        const auto sleep_ns = idle_sleep_ns_.load(std::memory_order_relaxed);
-        if (sleep_ns > 0) {
-          std::this_thread::sleep_for(std::chrono::microseconds(sleep_ns));
+        const auto sleep_us = idle_sleep_us_.load(std::memory_order_relaxed);
+        if (sleep_us > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
         }
       }
     }
@@ -447,9 +455,30 @@ class AsyncLoggerEngine final {
     FlushFile();
   }
 
+  [[nodiscard]] std::size_t EstimateFormattedBatchBytes(
+      std::span<const LogEntry> batch) const noexcept {
+    constexpr std::size_t kBasePerEntry = 48;
+    std::size_t total = 0;
+
+    for (const auto& entry : batch) {
+      total += kBasePerEntry;
+      total += entry.tid_size;
+      total += std::char_traits<char>::length(entry.file_name);
+      total += std::char_traits<char>::length(entry.function_name);
+      total += entry.message.View().size();
+      total += 12;  // file line digits + delimiters/newline margin.
+    }
+
+    total += batch.size() * 8;
+    return total;
+  }
+
   void FormatBatch(std::span<const LogEntry> batch, std::string& out) {
     out.clear();
-    out.reserve(batch.size() * 192);
+    const std::size_t estimate = EstimateFormattedBatchBytes(batch);
+    if (out.capacity() < estimate) {
+      out.reserve(estimate);
+    }
 
     for (const auto& entry : batch) {
       AppendFormattedEntry(entry, out);
@@ -601,9 +630,9 @@ class AsyncLoggerEngine final {
   std::atomic<std::size_t> queue_capacity_soft_{kDefaultQueueCapacity};
   std::atomic<std::size_t> max_batch_size_{kDefaultBatchSize};
   std::atomic<std::int64_t> flush_interval_ms_{kDefaultFlushInterval.count()};
-  std::atomic<std::uint32_t> spin_before_sleep_{256};
-  std::atomic<std::int64_t> idle_sleep_ns_{kDefaultIdleSleep.count()};
-  std::atomic<std::size_t> inline_message_capacity_{kDefaultInlineMessageCapacity};
+  std::atomic<std::uint32_t> spin_before_sleep_{128};
+  std::atomic<std::int64_t> idle_sleep_us_{kDefaultIdleSleep.count()};
+  std::atomic<std::size_t> inline_message_threshold_{kDefaultInlineMessageCapacity};
 
   std::atomic<DropPolicy> drop_policy_{DropPolicy::DropNewest};
   std::atomic<LogLevel> min_level_{LogLevel::kInfo};
