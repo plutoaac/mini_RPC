@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -14,10 +16,24 @@ enum class LogLevel : std::uint8_t {
   kError,
 };
 
+enum class DropPolicy : std::uint8_t {
+  DropNewest,
+  DropOldest,
+};
+
 struct LoggerOptions {
-  std::string file_path{"./rpc.log"};
+  std::filesystem::path log_file_path{"./rpc.log"};
+  std::size_t queue_capacity{1u << 18};
+  std::size_t max_batch_size{1024};
+  std::chrono::milliseconds flush_interval{500};
+  std::uint32_t spin_before_sleep{256};
+  std::chrono::microseconds idle_sleep{50};
+  DropPolicy drop_policy{DropPolicy::DropNewest};
   LogLevel min_level{LogLevel::kInfo};
-  std::chrono::milliseconds flush_interval{1000};
+  std::size_t inline_message_capacity{112};
+
+  // Compatibility field for older call sites.
+  std::string file_path{};
 };
 
 struct LoggerRuntimeStats {

@@ -5,83 +5,170 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
-#include <ctime>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace rpc::common::detail {
 namespace {
 
-constexpr std::size_t kQueueCapacity = 1u << 18;
-constexpr std::size_t kBatchSize = 1024;
-constexpr std::size_t kSpinBeforeSleep = 256;
-constexpr std::chrono::microseconds kIdleSleep{50};
-constexpr int kPushRetryLimit = 2;
-constexpr std::chrono::milliseconds kDroppedReportInterval{500};
-constexpr std::chrono::milliseconds kDefaultFlushInterval{1000};
-constexpr std::string_view kDefaultLogFile = "./rpc.log";
+constexpr std::size_t kRingCapacity = 1u << 18;
+constexpr std::size_t kDefaultQueueCapacity = 1u << 18;
+constexpr std::size_t kDefaultBatchSize = 1024;
+constexpr std::chrono::milliseconds kDefaultFlushInterval{500};
+constexpr std::chrono::microseconds kDefaultIdleSleep{50};
+constexpr std::chrono::milliseconds kDropSummaryInterval{500};
+constexpr std::size_t kDefaultInlineMessageCapacity = 112;
+constexpr std::string_view kDefaultLogFilePath = "./rpc.log";
 
-// Used to guarantee we only register one atexit hook.
+// Global one-time atexit registration guard.
 constinit std::atomic<bool> g_atexit_registered{false};
 
-[[nodiscard]] std::uint64_t CurrentThreadId() noexcept {
-  static thread_local const std::uint64_t cached_tid =
-      static_cast<std::uint64_t>(
-          std::hash<std::thread::id>{}(std::this_thread::get_id()));
-  return cached_tid;
+struct ThreadIdCache final {
+  std::array<char, 24> text{};
+  std::uint8_t size{1};
+};
+
+[[nodiscard]] const ThreadIdCache& CurrentThreadIdCache() noexcept {
+  static thread_local const ThreadIdCache cache = [] {
+    ThreadIdCache result;
+    const std::uint64_t tid_hash = static_cast<std::uint64_t>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const auto [ptr, ec] = std::to_chars(
+        result.text.data(), result.text.data() + result.text.size(), tid_hash);
+    if (ec == std::errc{}) {
+      result.size = static_cast<std::uint8_t>(ptr - result.text.data());
+      return result;
+    }
+    result.text[0] = '0';
+    result.size = 1;
+    return result;
+  }();
+
+  return cache;
 }
 
 [[nodiscard]] std::string TrimPath(std::string_view raw) {
   auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
 
-  // Find first non-space from left
-  auto left_it = raw.begin();
-  while (left_it != raw.end() && is_space(static_cast<unsigned char>(*left_it))) {
-    ++left_it;
+  auto begin = raw.begin();
+  while (begin != raw.end() && is_space(static_cast<unsigned char>(*begin))) {
+    ++begin;
   }
-  if (left_it == raw.end()) {
+  if (begin == raw.end()) {
     return {};
   }
 
-  // Find first non-space from right
-  auto right_it = raw.end();
-  while (right_it != raw.begin()) {
-    --right_it;
-    if (!is_space(static_cast<unsigned char>(*right_it))) {
-      ++right_it;
+  auto end = raw.end();
+  while (end != begin) {
+    const char ch = static_cast<char>(*(end - 1));
+    if (!is_space(static_cast<unsigned char>(ch))) {
       break;
     }
+    --end;
   }
 
-  return std::string(left_it, right_it);
+  return std::string(begin, end);
 }
 
 [[nodiscard]] constexpr std::uint8_t LevelValue(LogLevel level) noexcept {
   return static_cast<std::uint8_t>(level);
 }
 
-struct LogEntry {
+void AppendUnsigned(std::string& out, std::uint64_t value) {
+  char digits[24] = {0};
+  const auto [ptr, ec] =
+      std::to_chars(digits, digits + sizeof(digits), value);
+  if (ec == std::errc{}) {
+    out.append(digits, ptr);
+    return;
+  }
+  out.push_back('0');
+}
+
+void AppendMilliseconds3(std::string& out, int ms) {
+  const int safe_ms = std::max(0, std::min(999, ms));
+  out.push_back(static_cast<char>('0' + (safe_ms / 100)));
+  out.push_back(static_cast<char>('0' + ((safe_ms / 10) % 10)));
+  out.push_back(static_cast<char>('0' + (safe_ms % 10)));
+}
+
+class SmallLogMessage final {
+ public:
+  static constexpr std::size_t kInlineCapacity = 112;
+
+  SmallLogMessage() = default;
+  ~SmallLogMessage() = default;
+
+  SmallLogMessage(SmallLogMessage&&) noexcept = default;
+  SmallLogMessage& operator=(SmallLogMessage&&) noexcept = default;
+
+  SmallLogMessage(const SmallLogMessage&) = delete;
+  SmallLogMessage& operator=(const SmallLogMessage&) = delete;
+
+  void Assign(std::string_view message, std::size_t inline_limit) {
+    const std::size_t threshold =
+        std::max<std::size_t>(1, std::min(inline_limit, kInlineCapacity));
+
+    if (message.size() <= threshold) {
+      using_heap_ = false;
+      inline_size_ = static_cast<std::uint16_t>(message.size());
+      if (!message.empty()) {
+        std::memcpy(inline_buffer_.data(), message.data(), message.size());
+      }
+      heap_buffer_.clear();
+      return;
+    }
+
+    using_heap_ = true;
+    inline_size_ = 0;
+    heap_buffer_.assign(message.data(), message.size());
+  }
+
+  [[nodiscard]] std::string_view View() const noexcept {
+    if (using_heap_) {
+      return heap_buffer_;
+    }
+    return std::string_view(inline_buffer_.data(), inline_size_);
+  }
+
+ private:
+  bool using_heap_{false};
+  std::uint16_t inline_size_{0};
+  std::array<char, kInlineCapacity> inline_buffer_{};
+  std::string heap_buffer_;
+};
+
+struct LogEntry final {
   std::chrono::system_clock::time_point timestamp{
       std::chrono::system_clock::now()};
   LogLevel level{LogLevel::kInfo};
-  std::uint64_t tid{0};
+  std::array<char, 24> tid_text{};
+  std::uint8_t tid_size{1};
   const char* file_name{"unknown"};
   std::uint_least32_t line{0};
   const char* function_name{"unknown"};
-  std::string message;
+  SmallLogMessage message;
 };
+
+static_assert(std::is_nothrow_move_constructible_v<LogEntry>);
+static_assert(std::is_nothrow_move_assignable_v<LogEntry>);
 
 class AsyncLoggerEngine final {
  public:
   AsyncLoggerEngine() {
-    last_drop_report_time_ = std::chrono::steady_clock::now();
     StartWorkerIfNeeded();
     RegisterAtExit();
   }
@@ -91,13 +178,33 @@ class AsyncLoggerEngine final {
   void Init(const LoggerOptions& options) {
     SetLogLevel(options.min_level);
 
-    const auto flush_ms =
-        std::max<std::int64_t>(1, options.flush_interval.count());
-    flush_interval_ms_.store(flush_ms, std::memory_order_release);
+    queue_capacity_soft_.store(
+        std::max<std::size_t>(1, std::min(options.queue_capacity, kRingCapacity)),
+        std::memory_order_release);
+    max_batch_size_.store(
+        std::max<std::size_t>(1, options.max_batch_size), std::memory_order_release);
+    flush_interval_ms_.store(
+        std::max<std::int64_t>(1, options.flush_interval.count()),
+        std::memory_order_release);
+    spin_before_sleep_.store(
+        std::max<std::uint32_t>(1, options.spin_before_sleep),
+        std::memory_order_release);
+    idle_sleep_ns_.store(
+        std::max<std::int64_t>(0, options.idle_sleep.count()),
+        std::memory_order_release);
+    inline_message_capacity_.store(
+        std::max<std::size_t>(1,
+                              std::min(options.inline_message_capacity,
+                                       SmallLogMessage::kInlineCapacity)),
+        std::memory_order_release);
+    drop_policy_.store(options.drop_policy, std::memory_order_release);
 
-    if (!options.file_path.empty()) {
-      SetLogFile(options.file_path);
+    const std::string resolved_path = ResolveLogPath(options);
+    {
+      std::lock_guard<std::mutex> lock(path_mu_);
+      pending_log_path_ = resolved_path;
     }
+    reopen_requested_.store(true, std::memory_order_release);
 
     StartWorkerIfNeeded();
   }
@@ -110,21 +217,20 @@ class AsyncLoggerEngine final {
 
     {
       std::lock_guard<std::mutex> lock(path_mu_);
-      pending_file_path_ = normalized;
+      pending_log_path_ = normalized;
     }
     reopen_requested_.store(true, std::memory_order_release);
-    StartWorkerIfNeeded();
   }
 
   void SetLogLevel(LogLevel level) noexcept {
     min_level_.store(level, std::memory_order_release);
   }
 
-  [[nodiscard]] LogLevel GetLogLevel() const noexcept {
+  [[nodiscard]] LogLevel GetLogLevel() noexcept {
     return min_level_.load(std::memory_order_acquire);
   }
 
-  [[nodiscard]] LoggerRuntimeStats GetRuntimeStats() const noexcept {
+  [[nodiscard]] LoggerRuntimeStats GetRuntimeStats() noexcept {
     LoggerRuntimeStats stats;
     stats.submit_calls = submit_calls_.load(std::memory_order_acquire);
     stats.filtered_by_level =
@@ -141,45 +247,57 @@ class AsyncLoggerEngine final {
               const std::source_location& location) noexcept {
     submit_calls_.fetch_add(1, std::memory_order_relaxed);
 
-    if (!accepting_.load(std::memory_order_acquire)) {
+    if (!accepting_logs_.load(std::memory_order_acquire)) {
       return;
     }
 
+    // Fast path level filtering: filtered logs never touch the queue.
     if (LevelValue(level) < LevelValue(min_level_.load(std::memory_order_acquire))) {
       filtered_by_level_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
-    StartWorkerIfNeeded();
+    const std::size_t soft_cap = queue_capacity_soft_.load(std::memory_order_relaxed);
+    if (soft_cap < kRingCapacity &&
+      inflight_count_.load(std::memory_order_relaxed) >= soft_cap) {
+      // DropOldest is intentionally mapped to DropNewest in this phase because
+      // lock-free MPSC fast path should not mutate old slots.
+      dropped_.fetch_add(1, std::memory_order_relaxed);
+      dropped_for_summary_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
 
     LogEntry entry;
-    entry.timestamp = std::chrono::system_clock::now();
-    entry.level = level;
-    entry.tid = CurrentThreadId();
-    entry.file_name = Basename(location.file_name());
-    entry.line = location.line();
-    entry.function_name = location.function_name();
-    entry.message.assign(message.data(), message.size());
+    try {
+      entry.timestamp = std::chrono::system_clock::now();
+      entry.level = level;
+      const auto& tid = CurrentThreadIdCache();
+      entry.tid_size = tid.size;
+      std::memcpy(entry.tid_text.data(), tid.text.data(), tid.size);
+      entry.file_name = Basename(location.file_name());
+      entry.line = location.line();
+      entry.function_name = location.function_name();
+      // Phase 2 core change: producer captures structured fields only.
+      entry.message.Assign(
+          message, inline_message_capacity_.load(std::memory_order_relaxed));
+    } catch (...) {
+      dropped_.fetch_add(1, std::memory_order_relaxed);
+      dropped_for_summary_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
 
-    for (int retry = 0; retry < kPushRetryLimit; ++retry) {
-      if (queue_.TryPush(std::move(entry))) {
-        enqueued_.fetch_add(1, std::memory_order_relaxed);
-        return;
-      }
-      if (retry + 1 < kPushRetryLimit) {
-        std::this_thread::yield();
-      }
+    if (queue_.TryPush(std::move(entry))) {
+      inflight_count_.fetch_add(1, std::memory_order_relaxed);
+      enqueued_.fetch_add(1, std::memory_order_relaxed);
+      return;
     }
 
     dropped_.fetch_add(1, std::memory_order_relaxed);
-    dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    dropped_for_summary_.fetch_add(1, std::memory_order_relaxed);
   }
 
   void Shutdown() noexcept {
-    bool expected = true;
-    if (!accepting_.compare_exchange_strong(expected, false,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+    if (!accepting_logs_.exchange(false, std::memory_order_acq_rel)) {
       return;
     }
 
@@ -192,101 +310,94 @@ class AsyncLoggerEngine final {
   }
 
   static AsyncLoggerEngine& Instance() {
-    static AsyncLoggerEngine instance;
-    return instance;
+    static AsyncLoggerEngine engine;
+    return engine;
   }
 
  private:
   void StartWorkerIfNeeded() {
     bool expected = false;
-    if (!worker_started_.compare_exchange_strong(expected, true,
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_relaxed)) {
+    if (!worker_started_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
       return;
     }
 
+    // jthread + stop_token gives clear ownership and shutdown semantics.
     worker_ = std::jthread(
-        [this](std::stop_token stop_token) { WorkerMain(stop_token); });
+        [this](std::stop_token token) { WorkerLoop(token); });
   }
 
   void RegisterAtExit() {
     bool expected = false;
-    if (g_atexit_registered.compare_exchange_strong(expected, true,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed)) {
-      std::atexit([] {
-        AsyncLoggerEngine::Instance().Shutdown();
-      });
+    if (g_atexit_registered.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+      std::atexit([] { AsyncLoggerEngine::Instance().Shutdown(); });
     }
   }
 
-  [[nodiscard]] std::chrono::milliseconds FlushInterval() const noexcept {
-    return std::chrono::milliseconds(
-        flush_interval_ms_.load(std::memory_order_acquire));
+  [[nodiscard]] static std::string ResolveLogPath(const LoggerOptions& options) {
+    const std::string compat = TrimPath(options.file_path);
+    if (!compat.empty()) {
+      return compat;
+    }
+
+    if (!options.log_file_path.empty()) {
+      return options.log_file_path.string();
+    }
+
+    return std::string(kDefaultLogFilePath);
   }
 
-  [[nodiscard]] std::string PendingPath() {
+  [[nodiscard]] std::string CurrentLogPath() {
     std::lock_guard<std::mutex> lock(path_mu_);
-    return pending_file_path_;
+    return pending_log_path_;
   }
 
-  void ReopenFileIfRequested() {
-    if (!reopen_requested_.exchange(false, std::memory_order_acq_rel)) {
-      return;
-    }
-    OpenFile(PendingPath());
-  }
+  void WorkerLoop(std::stop_token stop_token) {
+    OpenFile(CurrentLogPath());
 
-  void OpenFile(std::string path) {
-    if (path.empty()) {
-      path = std::string(kDefaultLogFile);
-    }
+    std::vector<LogEntry> batch;
+    batch.resize(max_batch_size_.load(std::memory_order_acquire));
 
-    CloseFile();
-
-    file_ = std::fopen(path.c_str(), "ab");
-    if (file_ == nullptr) {
-      WriteFallback(std::string("[LOGGER][ERROR] open file failed: ") + path + "\n");
-      return;
-    }
-
-    std::setvbuf(file_, nullptr, _IOFBF, 1 << 20);
-  }
-
-  void CloseFile() noexcept {
-    if (file_ != nullptr) {
-      std::fflush(file_);
-      std::fclose(file_);
-      file_ = nullptr;
-    }
-  }
-
-  void WorkerMain(std::stop_token stop_token) {
-    OpenFile(PendingPath());
-
-    std::array<LogEntry, kBatchSize> batch;
-    std::size_t idle_spins = 0;
     auto last_flush = std::chrono::steady_clock::now();
+    auto last_drop_report = std::chrono::steady_clock::now();
 
-    while (!stop_token.stop_requested()) {
-      ReopenFileIfRequested();
-
-      const std::size_t n = queue_.PopBatch(std::span<LogEntry>(batch));
-      if (n > 0) {
-        idle_spins = 0;
-        consumed_.fetch_add(static_cast<std::uint64_t>(n),
-                            std::memory_order_relaxed);
-        WriteBatch(std::span<const LogEntry>(batch.data(), n));
-      } else {
-        if (idle_spins < kSpinBeforeSleep) {
-          ++idle_spins;
-          std::this_thread::yield();
-        } else {
-          std::this_thread::sleep_for(kIdleSleep);
-        }
+    for (;;) {
+      if (reopen_requested_.exchange(false, std::memory_order_acq_rel)) {
+        OpenFile(CurrentLogPath());
       }
 
-      EmitDroppedSummaryIfNeeded(false);
+      const std::size_t batch_limit =
+          max_batch_size_.load(std::memory_order_acquire);
+      if (batch.size() != batch_limit) {
+        batch.resize(batch_limit);
+      }
+
+      const std::size_t drained = queue_.PopBatch(
+          std::span<LogEntry>(batch.data(), batch.size()));
+
+      if (drained > 0) {
+        inflight_count_.fetch_sub(drained, std::memory_order_relaxed);
+        consumed_.fetch_add(drained, std::memory_order_relaxed);
+
+        FormatBatch(std::span<const LogEntry>(batch.data(), drained),
+                    formatted_batch_buffer_);
+        WriteBuffer(formatted_batch_buffer_);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (flush_requested_.exchange(false, std::memory_order_acq_rel) ||
+            now - last_flush >= FlushInterval()) {
+          FlushFile();
+          last_flush = now;
+        }
+
+        EmitDropSummaryIfNeeded(false, last_drop_report);
+        continue;
+      }
+
+      EmitDropSummaryIfNeeded(false, last_drop_report);
 
       const auto now = std::chrono::steady_clock::now();
       if (flush_requested_.exchange(false, std::memory_order_acq_rel) ||
@@ -294,81 +405,64 @@ class AsyncLoggerEngine final {
         FlushFile();
         last_flush = now;
       }
+
+      if (stop_token.stop_requested()) {
+        break;
+      }
+
+      const std::uint32_t spins = spin_before_sleep_.load(std::memory_order_relaxed);
+      bool has_work = false;
+      for (std::uint32_t i = 0; i < spins; ++i) {
+        if (inflight_count_.load(std::memory_order_relaxed) > 0 ||
+            reopen_requested_.load(std::memory_order_relaxed) ||
+            flush_requested_.load(std::memory_order_relaxed)) {
+          has_work = true;
+          break;
+        }
+        std::this_thread::yield();
+      }
+
+      if (!has_work) {
+        const auto sleep_ns = idle_sleep_ns_.load(std::memory_order_relaxed);
+        if (sleep_ns > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(sleep_ns));
+        }
+      }
     }
 
-    // stop requested: drain remaining entries for graceful shutdown.
-    DrainRemaining(batch);
-    EmitDroppedSummaryIfNeeded(true);
+    while (true) {
+      const std::size_t drained = queue_.PopBatch(
+          std::span<LogEntry>(batch.data(), batch.size()));
+      if (drained == 0) {
+        break;
+      }
+      inflight_count_.fetch_sub(drained, std::memory_order_relaxed);
+      consumed_.fetch_add(drained, std::memory_order_relaxed);
+      FormatBatch(std::span<const LogEntry>(batch.data(), drained),
+                  formatted_batch_buffer_);
+      WriteBuffer(formatted_batch_buffer_);
+    }
+
+    EmitDropSummaryIfNeeded(true, last_drop_report);
     FlushFile();
   }
 
-  void DrainRemaining(std::array<LogEntry, kBatchSize>& buffer) {
-    while (true) {
-      const std::size_t n = queue_.PopBatch(std::span<LogEntry>(buffer));
-      if (n == 0) {
-        break;
-      }
-      WriteBatch(std::span<const LogEntry>(buffer.data(), n));
-    }
-  }
-
-  void EmitDroppedSummaryIfNeeded(bool force_emit) {
-    pending_drop_report_ +=
-        dropped_count_.exchange(0, std::memory_order_acq_rel);
-
-    if (pending_drop_report_ == 0) {
-      return;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (!force_emit && now - last_drop_report_time_ < kDroppedReportInterval) {
-      return;
-    }
-
-    LogEntry summary;
-    summary.timestamp = std::chrono::system_clock::now();
-    summary.level = LogLevel::kWarn;
-    summary.tid = CurrentThreadId();
-    summary.file_name = "async_logger";
-    summary.function_name = "WorkerMain";
-    summary.message = "dropped " + std::to_string(pending_drop_report_) +
-                      " log entries because queue is full";
-    pending_drop_report_ = 0;
-    last_drop_report_time_ = now;
-    WriteBatch(std::span<const LogEntry>(&summary, 1));
-  }
-
-  void WriteBatch(std::span<const LogEntry> batch) {
-    if (batch.empty()) {
-      return;
-    }
-
-    write_buffer_.clear();
-    write_buffer_.reserve(batch.size() * 200);
+  void FormatBatch(std::span<const LogEntry> batch, std::string& out) {
+    out.clear();
+    out.reserve(batch.size() * 192);
 
     for (const auto& entry : batch) {
-      AppendFormattedEntry(entry);
+      AppendFormattedEntry(entry, out);
     }
-
-    if (file_ != nullptr) {
-      const std::size_t written =
-          std::fwrite(write_buffer_.data(), 1, write_buffer_.size(), file_);
-      if (written == write_buffer_.size()) {
-        return;
-      }
-      WriteFallback(std::string_view(write_buffer_).substr(written));
-      return;
-    }
-
-    WriteFallback(write_buffer_);
   }
 
-  void AppendFormattedEntry(const LogEntry& entry) {
+  void AppendFormattedEntry(const LogEntry& entry, std::string& out) {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         entry.timestamp.time_since_epoch()) %
                     1000;
     const std::time_t sec = std::chrono::system_clock::to_time_t(entry.timestamp);
 
+    // Second-level cache avoids full strftime for every log line.
     if (sec != cached_second_) {
       std::tm local_tm{};
 #if defined(_WIN32)
@@ -384,21 +478,100 @@ class AsyncLoggerEngine final {
       cached_second_ = sec;
     }
 
-    char prefix[768] = {0};
-    std::snprintf(prefix, sizeof(prefix),
-                  "[%s.%03d][%s][tid=%llu] %s:%u %s | ",
-                  cached_second_text_.data(), static_cast<int>(ms.count()),
-                  LogLevelName(entry.level),
-                  static_cast<unsigned long long>(entry.tid), entry.file_name,
-                  static_cast<unsigned int>(entry.line), entry.function_name);
-
-    write_buffer_.append(prefix);
-    write_buffer_.append(entry.message);
-    write_buffer_.push_back('\n');
+    out.push_back('[');
+    out.append(cached_second_text_.data());
+    out.push_back('.');
+    AppendMilliseconds3(out, static_cast<int>(ms.count()));
+    out.append("][");
+    out.append(LogLevelName(entry.level));
+    out.append("][tid=");
+    out.append(entry.tid_text.data(), entry.tid_size);
+    out.append("] ");
+    out.append(entry.file_name);
+    out.push_back(':');
+    AppendUnsigned(out, static_cast<std::uint64_t>(entry.line));
+    out.push_back(' ');
+    out.append(entry.function_name);
+    out.append(" | ");
+    out.append(entry.message.View());
+    out.push_back('\n');
   }
 
-  void WriteFallback(std::string_view data) noexcept {
-    std::fwrite(data.data(), 1, data.size(), stderr);
+  void WriteBuffer(std::string_view bytes) noexcept {
+    if (bytes.empty()) {
+      return;
+    }
+
+    if (file_ != nullptr) {
+      const std::size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file_);
+      if (written == bytes.size()) {
+        return;
+      }
+      WriteFallback(bytes.substr(written));
+      return;
+    }
+
+    WriteFallback(bytes);
+  }
+
+  void EmitDropSummaryIfNeeded(
+      bool force_emit,
+      std::chrono::steady_clock::time_point& last_drop_report) {
+    pending_drop_summary_ +=
+        dropped_for_summary_.exchange(0, std::memory_order_acq_rel);
+
+    if (pending_drop_summary_ == 0) {
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force_emit && now - last_drop_report < kDropSummaryInterval) {
+      return;
+    }
+    last_drop_report = now;
+
+    LogEntry summary;
+    summary.timestamp = std::chrono::system_clock::now();
+    summary.level = LogLevel::kWarn;
+    const auto& tid = CurrentThreadIdCache();
+    summary.tid_size = tid.size;
+    std::memcpy(summary.tid_text.data(), tid.text.data(), tid.size);
+    summary.file_name = "async_logger";
+    summary.function_name = "EmitDropSummaryIfNeeded";
+
+    const std::string text =
+        "dropped " + std::to_string(pending_drop_summary_) +
+        " log entries because queue is full";
+    summary.message.Assign(text, SmallLogMessage::kInlineCapacity);
+
+    pending_drop_summary_ = 0;
+
+    std::array<LogEntry, 1> one{std::move(summary)};
+    FormatBatch(std::span<const LogEntry>(one.data(), one.size()),
+                formatted_batch_buffer_);
+    WriteBuffer(formatted_batch_buffer_);
+  }
+
+  [[nodiscard]] std::chrono::milliseconds FlushInterval() const noexcept {
+    return std::chrono::milliseconds(
+        flush_interval_ms_.load(std::memory_order_acquire));
+  }
+
+  void OpenFile(const std::string& path) {
+    std::string resolved = path;
+    if (resolved.empty()) {
+      resolved = std::string(kDefaultLogFilePath);
+    }
+
+    CloseFile();
+
+    file_ = std::fopen(resolved.c_str(), "ab");
+    if (file_ == nullptr) {
+      WriteFallback(std::string("[LOGGER][ERROR] open file failed: ") + resolved + "\n");
+      return;
+    }
+
+    std::setvbuf(file_, nullptr, _IOFBF, 1 << 20);
   }
 
   void FlushFile() noexcept {
@@ -407,32 +580,58 @@ class AsyncLoggerEngine final {
     }
   }
 
-  MpscRingQueue<LogEntry, kQueueCapacity> queue_;
+  void CloseFile() noexcept {
+    if (file_ != nullptr) {
+      std::fflush(file_);
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+  }
 
+  void WriteFallback(std::string_view bytes) noexcept {
+    if (bytes.empty()) {
+      return;
+    }
+    std::fwrite(bytes.data(), 1, bytes.size(), stderr);
+  }
+
+  MpscRingQueue<LogEntry, kRingCapacity> queue_;
+
+  std::atomic<std::size_t> inflight_count_{0};
+  std::atomic<std::size_t> queue_capacity_soft_{kDefaultQueueCapacity};
+  std::atomic<std::size_t> max_batch_size_{kDefaultBatchSize};
+  std::atomic<std::int64_t> flush_interval_ms_{kDefaultFlushInterval.count()};
+  std::atomic<std::uint32_t> spin_before_sleep_{256};
+  std::atomic<std::int64_t> idle_sleep_ns_{kDefaultIdleSleep.count()};
+  std::atomic<std::size_t> inline_message_capacity_{kDefaultInlineMessageCapacity};
+
+  std::atomic<DropPolicy> drop_policy_{DropPolicy::DropNewest};
   std::atomic<LogLevel> min_level_{LogLevel::kInfo};
-  std::atomic<std::int64_t> flush_interval_ms_{
-      kDefaultFlushInterval.count()};
+
+  std::atomic<bool> accepting_logs_{true};
+  std::atomic<bool> worker_started_{false};
+  std::atomic<bool> flush_requested_{false};
+  std::atomic<bool> reopen_requested_{false};
+
   std::atomic<std::uint64_t> submit_calls_{0};
   std::atomic<std::uint64_t> filtered_by_level_{0};
   std::atomic<std::uint64_t> enqueued_{0};
   std::atomic<std::uint64_t> consumed_{0};
   std::atomic<std::uint64_t> dropped_{0};
-  std::atomic<std::uint64_t> dropped_count_{0};
-  std::atomic<bool> flush_requested_{false};
-  std::atomic<bool> reopen_requested_{false};
-  std::atomic<bool> accepting_{true};
-  std::atomic<bool> worker_started_{false};
+  std::atomic<std::uint64_t> dropped_for_summary_{0};
+
+  std::uint64_t pending_drop_summary_{0};
 
   std::mutex path_mu_;
-  std::string pending_file_path_{std::string(kDefaultLogFile)};
+  std::string pending_log_path_{std::string(kDefaultLogFilePath)};
 
   std::FILE* file_{nullptr};
   std::jthread worker_;
-  std::string write_buffer_;
+
+  std::string formatted_batch_buffer_;
+
   std::time_t cached_second_{static_cast<std::time_t>(-1)};
   std::array<char, 32> cached_second_text_{};
-  std::uint64_t pending_drop_report_{0};
-  std::chrono::steady_clock::time_point last_drop_report_time_{};
 };
 
 }  // namespace
