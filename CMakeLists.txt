@@ -33,6 +33,8 @@ add_library(rpc_framework
     src/client/event_loop.cpp
     src/client/pending_calls.cpp
     src/client/rpc_client.cpp
+    src/client/load_balancer.cpp
+    src/client/rpc_client_pool.cpp
 )
 
 target_include_directories(rpc_framework
@@ -327,6 +329,18 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME heartbeat_test COMMAND heartbeat_test)
+
+    add_executable(rpc_client_pool_test
+        tests/rpc_client_pool_test.cpp
+    )
+
+    target_link_libraries(rpc_client_pool_test
+        PRIVATE
+            rpc_framework
+            Threads::Threads
+    )
+
+    add_test(NAME rpc_client_pool_test COMMAND rpc_client_pool_test)
 endif()
 
 add_executable(rpc_benchmark

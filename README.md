@@ -47,6 +47,8 @@
 - 基于 `std::source_location` 的轻量结构化日志
 - 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
 - 客户端读写分工模型（调用线程发送 + event loop 驱动可读事件）
+- 客户端连接池（`RpcClientPool`）与基础负载均衡（RoundRobin / LeastInflight）
+- 客户端最小健康检查与故障转移（同步 Call 自动重试）
 - 自动化测试入口（协议层、注册中心、端到端）
 - Benchmark 入口（单连接延迟与吞吐）
 - 慢 handler 场景对比 benchmark（inline 执行 vs thread pool 执行）
@@ -523,7 +525,85 @@ cd rpc_project/build
 
 输出会包含两种模式的 avg/p95/qps 以及 `qps_speedup`。
 
-## 13. 可扩展性说明
+## 13. 客户端连接池与负载均衡（新增）
+
+### 13.1 设计目标
+
+在现有单连接 `RpcClient` 基础上，增量增强为多 endpoint 客户端连接池，不推翻 `Call / CallAsync / CallCo` 主链路，对外保持一致的调用风格。
+
+### 13.2 核心组件
+
+- `src/client/load_balancer.*`
+  - `LoadBalancer`：策略基类，负责从 healthy 候选节点中选择一个
+  - `RoundRobinBalancer`：原子计数器实现无锁轮询
+  - `LeastInflightBalancer`：实时比较各节点 `GetInflightCount()`，选最小者
+
+- `src/client/rpc_client_pool.*`
+  - `RpcClientPool`：持有多个 `RpcClient`（每个 endpoint 独占一个）
+  - 支持 `Call`（同步，含自动重试）、`CallAsync`（异步）、`CallCo`（协程）
+  - 最小健康检查：连续失败超阈值后标记 unhealthy，剔除出候选集
+  - 运行时统计：`inflight`、`success/fail count`、`select_count`、`healthy`、`connected`
+
+### 13.3 使用示例
+
+```cpp
+rpc::client::RpcClientPool pool(
+    {{"127.0.0.1", 50051},
+     {"127.0.0.1", 50052},
+     {"127.0.0.1", 50053}},
+    rpc::client::RpcClientPoolOptions{
+        .client_options =
+            rpc::client::RpcClientOptions{
+                .send_timeout = std::chrono::milliseconds(1000),
+                .recv_timeout = std::chrono::milliseconds(1000)},
+        .strategy = rpc::client::LoadBalanceStrategy::kLeastInflight,
+        .max_consecutive_failures = 3});
+
+// 预热（可选）
+pool.Warmup();
+
+// 同步调用（自动重试）
+auto result = pool.Call("CalcService", "Add", payload);
+
+// 异步调用
+auto future = pool.CallAsync("CalcService", "Add", payload);
+
+// 协程调用
+auto task = pool.CallCo("CalcService", "Add", payload);
+```
+
+### 13.4 线程安全
+
+- `SelectChannel`、`Call`、`CallAsync`、`CallCo` 均可多线程并发调用
+- 各 channel 统计使用原子变量，健康状态使用原子 bool
+- `RoundRobin` 使用 `fetch_add` 实现无锁轮询
+- `LeastInflight` 读取各节点 `GetInflightCount()`（内部也是原子操作）
+
+### 13.5 设计取舍
+
+1. **不复用连接**：每个 endpoint 独占 `RpcClient`，保持简单，不引入共享连接的复杂状态机。
+2. **不重写 RpcClient**：Pool 只做"选择 + 转发"，复用现有 `Call/CallAsync/CallCo` 链路。
+3. **异步/协程路径不重试**：`future`/`Task` 已发出后难以安全撤回，重试由同步 `Call` 承担。
+4. **inflight 精确统计**：直接透传 `RpcClient::GetInflightCount()`，避免 Pool 层自行维护的误差。
+5. **最小健康检查**：仅基于连续失败计数，不做复杂熔断（如滑动窗口、半开状态）。
+
+### 13.6 新增测试
+
+- `rpc_client_pool_test`
+  - RoundRobin 多 endpoint 分发正确
+  - LeastInflight 倾向选择负载轻的连接
+  - 某个 endpoint 挂掉时自动故障转移
+  - `CallAsync` / `CallCo` 在 pool 模式下仍正确工作
+  - 乱序响应不会污染其它 endpoint 的结果匹配
+
+运行：
+
+```bash
+cd rpc_project/build
+./rpc_client_pool_test
+```
+
+## 14. 可扩展性说明
 
 当前版本不是生产级 RPC 框架，定位是“可运行、可讲清楚、可继续演进”的工程化样例：
 - 保留当前多 WorkerLoop + Connection coroutine 主路径

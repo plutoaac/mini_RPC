@@ -493,6 +493,18 @@ RpcCallResult RpcClient::Call(std::string_view service_name,
   return CallAsync(service_name, method_name, request_payload).get();
 }
 
+std::size_t RpcClient::GetInflightCount() const {
+  if (!pending_calls_) {
+    return 0;
+  }
+  return pending_calls_->Size();
+}
+
+bool RpcClient::IsConnected() const {
+  std::scoped_lock lock(connect_mu_);
+  return sock_.operator bool();
+}
+
 rpc::coroutine::Task<RpcCallResult> RpcClient::CallCo(
     std::string_view service_name, std::string_view method_name,
     std::string_view request_payload) {

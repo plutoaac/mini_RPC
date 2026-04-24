@@ -103,6 +103,14 @@ class RpcClient {
       std::string_view service_name, std::string_view method_name,
       std::string_view request_payload);
 
+  /// 获取当前 inflight 请求数（进行中的未响应请求）
+  ///
+  /// 供上层连接池做 LeastInflight 负载均衡决策。
+  [[nodiscard]] std::size_t GetInflightCount() const;
+
+  /// 检查当前连接是否已建立
+  [[nodiscard]] bool IsConnected() const;
+
  private:
   /// 生成下一个请求 ID
   /// 使用原子计数器保证唯一性
@@ -123,7 +131,7 @@ class RpcClient {
   RpcClientOptions options_;
   /// socket 文件描述符，使用 RAII 包装自动管理生命周期
   rpc::common::UniqueFd sock_;
-  std::mutex connect_mu_;
+  mutable std::mutex connect_mu_;
   std::mutex write_mu_;
   std::thread dispatcher_thread_;
   std::atomic<bool> dispatcher_running_{false};
