@@ -91,6 +91,9 @@ class RpcClientPool {
   ///
   /// 选择一个健康节点后委托给该节点的 CallAsync。
   /// 若当前无健康节点，返回已完成的失败 future。
+  ///
+  /// @note 当前 CallAsync 只负责选择和转发，完成后的 health update 暂不做。
+  ///       后续如果引入自定义 future/continuation，可补齐。
   [[nodiscard]] std::future<RpcCallResult> CallAsync(
       std::string_view service_name, std::string_view method_name,
       std::string_view request_payload);
@@ -98,6 +101,7 @@ class RpcClientPool {
   /// 协程 RPC 调用（不重试）
   ///
   /// 选择一个健康节点后委托给该节点的 CallCo。
+  /// 完成后根据结果更新节点健康状态（仅连接类错误影响健康）。
   [[nodiscard]] rpc::coroutine::Task<RpcCallResult> CallCo(
       std::string_view service_name, std::string_view method_name,
       std::string_view request_payload);
@@ -106,9 +110,9 @@ class RpcClientPool {
   struct EndpointStats {
     std::string endpoint;          // "host:port"
     std::size_t inflight;          // 当前未响应请求数
-    std::size_t success_count;     // 累计成功次数（同步 Call）
-    std::size_t fail_count;        // 累计失败次数（同步 Call）
-    std::size_t select_count;      // 被选中次数
+    std::size_t success_count;     // 累计成功次数
+    std::size_t fail_count;        // 累计失败次数
+    std::size_t select_count;      // 被负载均衡器选中次数
     bool healthy;                  // 当前健康状态
     bool connected;                // 当前是否已连接
   };
@@ -123,13 +127,22 @@ class RpcClientPool {
   struct Channel;
 
   /// 选择一个可用 channel
+  /// @param excluded 本轮已经尝试过的 channel，会被排除在候选之外
   /// @return 选中的 channel 指针；若无任何可用节点返回 nullptr
+  Channel* SelectChannel(const std::vector<Channel*>& excluded);
+
+  /// 简化版：选择可用 channel（无排除列表）
   Channel* SelectChannel();
 
-  /// 更新 channel 健康状态
+  /// 记录节点可达性（只影响健康状态）
   /// @param channel 目标 channel
-  /// @param success 本次调用是否成功
-  void UpdateHealth(Channel* channel, bool success);
+  /// @param reachable true 表示连接可达，false 表示连接/网络类失败
+  void RecordReachability(Channel* channel, bool reachable);
+
+  /// 记录调用结果（只影响 success/fail 统计）
+  /// @param channel 目标 channel
+  /// @param result 本次 RPC 调用结果
+  void RecordCallResult(Channel* channel, const RpcCallResult& result);
 
   /// 判断错误是否为连接/网络类错误（决定是否标记节点不健康）
   static bool IsConnectionError(const RpcCallResult& result);

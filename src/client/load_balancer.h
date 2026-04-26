@@ -46,11 +46,23 @@ class RoundRobinBalancer : public LoadBalancer {
 /// 每次选择当前 inflight（未响应请求数）最少的连接。
 /// 通过 RpcClient::GetInflightCount() 获取实时 inflight 数，
 /// 无需 Pool 层自行维护计数，保证精确且避免重复统计。
+///
+/// ## 为什么需要 tie-break？
+///
+/// 在轻载或空闲场景下，大多数节点 inflight 同时为 0。
+/// 如果不做 tie-break，会长期偏向第一个候选节点，
+/// 导致负载均衡退化为“总是选第一个”。
+/// 因此我们在 inflight 相同的节点子集内再做一轮原子轮询，
+/// 既保持最小 inflight 语义，又避免热点。
 class LeastInflightBalancer : public LoadBalancer {
  public:
   std::size_t Select(
       const std::vector<RpcClient*>& candidates) override;
   const char* Name() const override { return "LeastInflight"; }
+
+ private:
+  /// 当多个节点 inflight 相同时，用原子计数器做轮询打散。
+  std::atomic<std::size_t> tie_breaker_{0};
 };
 
 }  // namespace rpc::client

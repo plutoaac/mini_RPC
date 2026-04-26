@@ -72,8 +72,15 @@ bool RpcClientPool::Warmup() {
   for (auto& ch : channels_) {
     if (ch->client->Connect()) {
       ++connected;
+      // 预热成功：清零失败计数并标记健康
+      ch->consecutive_failures.store(0, std::memory_order_release);
+      ch->healthy.store(true, std::memory_order_release);
     } else {
       common::LogWarn("RpcClientPool warmup failed for " + ch->EndpointString());
+      // 预热失败：直接标记不健康，避免后续仍参与选择
+      ch->consecutive_failures.store(options_.max_consecutive_failures,
+                                     std::memory_order_release);
+      ch->healthy.store(false, std::memory_order_release);
     }
   }
   return connected > 0;
@@ -84,12 +91,18 @@ bool RpcClientPool::Warmup() {
 // ============================================================================
 
 RpcClientPool::Channel* RpcClientPool::SelectChannel() {
-  // 1. 收集 healthy 候选节点
+  return SelectChannel({});
+}
+
+RpcClientPool::Channel* RpcClientPool::SelectChannel(
+    const std::vector<Channel*>& excluded) {
+  // 1. 收集 healthy 且不在排除列表中的候选节点
   std::vector<Channel*> healthy_candidates;
   healthy_candidates.reserve(channels_.size());
 
   for (auto& ch : channels_) {
-    if (ch->healthy.load(std::memory_order_acquire)) {
+    if (ch->healthy.load(std::memory_order_acquire) &&
+        std::find(excluded.begin(), excluded.end(), ch.get()) == excluded.end()) {
       healthy_candidates.push_back(ch.get());
     }
   }
@@ -117,17 +130,16 @@ RpcClientPool::Channel* RpcClientPool::SelectChannel() {
 }
 
 // ============================================================================
-// 健康状态更新
+// 健康状态与统计
 // ============================================================================
 
-void RpcClientPool::UpdateHealth(Channel* channel, bool success) {
-  if (success) {
-    channel->success_count.fetch_add(1, std::memory_order_relaxed);
-    // 成功则清零连续失败计数
+void RpcClientPool::RecordReachability(Channel* channel, bool reachable) {
+  if (reachable) {
+    // 连接可达：清零连续失败计数并标记健康
     channel->consecutive_failures.store(0, std::memory_order_release);
     channel->healthy.store(true, std::memory_order_release);
   } else {
-    channel->fail_count.fetch_add(1, std::memory_order_relaxed);
+    // 连接不可达：递增连续失败计数
     const std::size_t failures =
         channel->consecutive_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (failures >= options_.max_consecutive_failures) {
@@ -136,6 +148,15 @@ void RpcClientPool::UpdateHealth(Channel* channel, bool success) {
                       " consecutive failures");
       channel->healthy.store(false, std::memory_order_release);
     }
+  }
+}
+
+void RpcClientPool::RecordCallResult(Channel* channel,
+                                     const RpcCallResult& result) {
+  if (result.ok()) {
+    channel->success_count.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    channel->fail_count.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -154,7 +175,7 @@ bool RpcClientPool::IsConnectionError(const RpcCallResult& result) {
 }
 
 // ============================================================================
-// 同步 Call（支持重试）
+// 同步 Call（支持重试，每轮排除已尝试节点）
 // ============================================================================
 
 RpcCallResult RpcClientPool::Call(std::string_view service_name,
@@ -167,11 +188,12 @@ RpcCallResult RpcClientPool::Call(std::string_view service_name,
         {}};
   }
 
-  // 记录本轮已经尝试过的 channel，避免死循环重试同一个节点
-  // 由于 SelectChannel 依赖 balancer 状态，多次调用可能选到不同节点
+  std::vector<Channel*> attempted;
+  attempted.reserve(channels_.size());
+
   const std::size_t max_attempts = channels_.size();
   for (std::size_t attempt = 0; attempt < max_attempts; ++attempt) {
-    Channel* ch = SelectChannel();
+    Channel* ch = SelectChannel(attempted);
     if (!ch) {
       return RpcCallResult{
           {common::make_error_code(common::ErrorCode::kInternalError),
@@ -179,23 +201,26 @@ RpcCallResult RpcClientPool::Call(std::string_view service_name,
           {}};
     }
 
+    attempted.push_back(ch);
     auto result = ch->client->Call(service_name, method_name, request_payload);
+    RecordCallResult(ch, result);
 
     if (result.ok()) {
-      UpdateHealth(ch, true);
+      RecordReachability(ch, true);
       return result;
     }
 
-    // 失败处理：如果是连接类错误，标记节点不健康并尝试下一个
+    // 失败处理：如果是连接类错误，标记节点不可达并尝试下一个
     if (IsConnectionError(result)) {
-      UpdateHealth(ch, false);
+      RecordReachability(ch, false);
       common::LogWarn("RpcClientPool: call failed on " + ch->EndpointString() +
                       ", retrying... attempt=" + std::to_string(attempt + 1));
       continue;
     }
 
     // 业务错误（如 MethodNotFound）不重试，直接返回
-    UpdateHealth(ch, true);  // 业务错误不算连接失败，但计一次 fail_count
+    // 业务错误说明连接本身是好的，标记可达
+    RecordReachability(ch, true);
     return result;
   }
 
@@ -223,12 +248,12 @@ std::future<RpcCallResult> RpcClientPool::CallAsync(
     return future;
   }
 
-  ch->select_count.fetch_add(1, std::memory_order_relaxed);
+  // select_count 已在 SelectChannel() 中统一计数，此处不再重复
   return ch->client->CallAsync(service_name, method_name, request_payload);
 }
 
 // ============================================================================
-// 协程 CallCo（不重试）
+// 协程 CallCo（不重试，但完成后更新健康状态）
 // ============================================================================
 
 rpc::coroutine::Task<RpcCallResult> RpcClientPool::CallCo(
@@ -242,9 +267,15 @@ rpc::coroutine::Task<RpcCallResult> RpcClientPool::CallCo(
         {}};
   }
 
-  ch->select_count.fetch_add(1, std::memory_order_relaxed);
-  co_return co_await ch->client->CallCo(service_name, method_name,
-                                        request_payload);
+  // select_count 已在 SelectChannel() 中统一计数，此处不再重复
+  auto result = co_await ch->client->CallCo(service_name, method_name,
+                                            request_payload);
+
+  RecordCallResult(ch, result);
+  // 只有连接类错误才影响节点健康状态；业务错误不影响
+  RecordReachability(ch, !IsConnectionError(result));
+
+  co_return result;
 }
 
 // ============================================================================
