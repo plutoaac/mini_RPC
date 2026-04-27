@@ -367,6 +367,7 @@ target_link_libraries(rpc_thread_pool_benchmark
 
 add_executable(rpc_benchmark_pipeline
     benchmarks/rpc_benchmark_pipeline.cpp
+    benchmarks/benchmark_config.cpp
 )
 
 target_link_libraries(rpc_benchmark_pipeline
@@ -377,6 +378,7 @@ target_link_libraries(rpc_benchmark_pipeline
 
 add_executable(rpc_benchmark_conn_pool
     benchmarks/benchmark_stats.cpp
+    benchmarks/benchmark_config.cpp
     benchmarks/rpc_benchmark_conn_pool.cpp
 )
 

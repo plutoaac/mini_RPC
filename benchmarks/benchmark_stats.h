@@ -11,6 +11,8 @@ namespace rpc::benchmark {
 
 struct BenchmarkResult {
   std::string mode;
+  int connections{1};     // number of connections (default 1 for single connection)
+  int depth{1};          // pipeline depth per connection (default 1)
   int concurrency{0};
   int payload_bytes{0};
   int total_requests{0};
@@ -35,19 +37,21 @@ struct LocalStats {
 
 class BenchmarkStats {
  public:
-  BenchmarkStats(std::string mode, int concurrency, int payload_bytes,
-                 int total_requests);
+  BenchmarkStats(std::string mode, int connections, int depth,
+                 int concurrency, int payload_bytes, int total_requests);
 
   void Merge(LocalStats local);
 
   BenchmarkResult Finalize(std::chrono::steady_clock::time_point begin,
-                           std::chrono::steady_clock::time_point end);
+                            std::chrono::steady_clock::time_point end);
 
  private:
   static double Percentile(const std::vector<long long>& sorted,
                            double quantile);
 
   std::string mode_;
+  int connections_{1};
+  int depth_{1};
   int concurrency_{0};
   int payload_bytes_{0};
   int total_requests_{0};
@@ -66,5 +70,12 @@ bool WriteBenchmarkResultFiles(const BenchmarkResult& result,
                                std::string_view output_dir,
                                std::string_view file_stem,
                                std::string* text_path, std::string* csv_path);
+
+// Helper to create BenchmarkStats with default connections=1, depth=1
+inline BenchmarkStats MakeBenchmarkStats(const std::string& mode,
+                                          int concurrency, int payload_bytes,
+                                          int total_requests) {
+  return BenchmarkStats(mode, 1, 1, concurrency, payload_bytes, total_requests);
+}
 
 }  // namespace rpc::benchmark

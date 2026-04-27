@@ -11,9 +11,10 @@
 namespace rpc::common {
 
 enum class LogLevel : std::uint8_t {
-  kInfo,
-  kWarn,
-  kError,
+  kInfo,    // 0: Information logs
+  kWarn,    // 1: Warning logs
+  kError,   // 2: Error logs
+  kOff,     // 3: Completely disable all logging (fast path return)
 };
 
 enum class DropPolicy : std::uint8_t {
@@ -59,6 +60,8 @@ struct LoggerRuntimeStats {
       return "WARN";
     case LogLevel::kError:
       return "ERROR";
+    case LogLevel::kOff:
+      return "OFF";
     default:
       return "UNKNOWN";
   }
@@ -88,6 +91,7 @@ void Log(
     const std::source_location& location = std::source_location::current())
     noexcept;
 
+// Fast path: when kOff, avoid any formatting/enqueue overhead
 inline void LogInfo(
     std::string_view message,
     const std::source_location& location = std::source_location::current()) {

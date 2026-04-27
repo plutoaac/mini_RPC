@@ -1,3 +1,22 @@
+/**
+ * @file rpc_benchmark.cpp
+ * @brief 基础 RPC 延迟与吞吐 benchmark
+ *
+ * 定位：baseline benchmark，测最基础的 RPC 调用延迟和吞吐
+ *
+ * 模型：
+ *   - 启动内嵌服务端
+ *   - 创建 N 个并发 client 线程
+ *   - 每个线程使用 sync/async/coroutine 模式调用
+ *   - 测量端到端延迟和 QPS
+ *
+ * 运行：
+ *   ./rpc_benchmark 1000                          # 默认 sync 模式，1000 请求
+ *   ./rpc_benchmark --mode=sync --requests=5000    # sync 模式
+ *   ./rpc_benchmark --mode=async --requests=5000   # async 模式
+ *   ./rpc_benchmark --mode=co --requests=5000      # coroutine 模式
+ */
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,6 +31,7 @@
 
 #include "benchmark_stats.h"
 #include "client/rpc_client.h"
+#include "common/log.h"
 #include "coroutine/task.h"
 #include "server/rpc_server.h"
 #include "server/service_registry.h"
@@ -155,6 +175,10 @@ bool ParseArgs(const int argc, char** argv, BenchmarkOptions* options) {
       options->output_dir = arg.substr(13);
       continue;
     }
+    if (arg.rfind("--log=", 0) == 0) {
+      // log level handled in main, just accept the argument
+      continue;
+    }
 
     int value = 0;
     if (!ParseIntArg(arg, &value)) {
@@ -193,8 +217,8 @@ rpc::benchmark::LocalStats RunSyncWorker(rpc::client::RpcClient* client,
 }
 
 rpc::benchmark::LocalStats RunAsyncWorker(rpc::client::RpcClient* client,
-                                          const std::string& payload,
-                                          const int request_count) {
+                                           const std::string& payload,
+                                           const int request_count) {
   rpc::benchmark::LocalStats stats;
   stats.latency_us.reserve(static_cast<std::size_t>(request_count));
 
@@ -268,9 +292,23 @@ rpc::benchmark::BenchmarkResult RunBenchmark(const BenchmarkOptions& options) {
     std::abort();
   }
 
+  // Warmup: send a few requests before timing
+  {
+    rpc::client::RpcClient warmup_client(
+        "127.0.0.1", options.port,
+        {.send_timeout = std::chrono::milliseconds(3000),
+         .recv_timeout = std::chrono::milliseconds(3000)});
+    const std::string warmup_payload = BuildPayload(options.payload_bytes);
+    for (int i = 0; i < 5; ++i) {
+      [[maybe_unused]] auto _ = warmup_client.Call("BenchmarkService", "Echo",
+                                                  warmup_payload);
+    }
+  }
+
+  // connections=1 (single connection benchmark), depth=1
   rpc::benchmark::BenchmarkStats stats(
-      ModeToString(options.mode), options.concurrency, options.payload_bytes,
-      options.total_requests);
+      ModeToString(options.mode), 1, 1, options.concurrency,
+      options.payload_bytes, options.total_requests);
 
   const std::string payload = BuildPayload(options.payload_bytes);
   const int base = options.total_requests / options.concurrency;
@@ -329,12 +367,34 @@ rpc::benchmark::BenchmarkResult RunBenchmark(const BenchmarkOptions& options) {
 void PrintUsage() {
   std::cout << "usage: rpc_benchmark [--mode=sync|async|co] [--requests=N] "
                "[--concurrency=N] [--payload_bytes=N] [--port=N] "
-               "[--output_dir=PATH]\n";
+               "[--output_dir=PATH]\n"
+            << "  --mode=sync|async|co  Call mode (default: sync)\n"
+            << "  --requests=N          Total requests (default: 10000)\n"
+            << "  --concurrency=N       Number of client threads (default: 8)\n"
+            << "  --payload_bytes=N     Payload size in bytes (default: 128)\n"
+            << "  --port=N              Server port (default: 50051)\n"
+            << "  --output_dir=PATH     Output directory (default: benchmarks/results)\n";
 }
 
 }  // namespace
 
+static rpc::common::LogLevel ParseLogArg(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg(argv[i]);
+    if (arg.rfind("--log=", 0) == 0) {
+      std::string val = arg.substr(6);
+      if (val == "off") return rpc::common::LogLevel::kOff;
+      if (val == "error") return rpc::common::LogLevel::kError;
+      if (val == "info") return rpc::common::LogLevel::kInfo;
+    }
+  }
+  return rpc::common::LogLevel::kOff;  // Default to off for clean benchmarks
+}
+
 int main(int argc, char** argv) {
+  // Apply log level from --log argument (default: off)
+  rpc::common::SetLogLevel(ParseLogArg(argc, argv));
+
   BenchmarkOptions options;
   if (!ParseArgs(argc, argv, &options)) {
     PrintUsage();
@@ -344,6 +404,12 @@ int main(int argc, char** argv) {
   const auto result = RunBenchmark(options);
   rpc::benchmark::PrintBenchmarkResult(result);
   rpc::benchmark::PrintBenchmarkCsv(result);
+
+  // Check for failures
+  if (result.failed_count > 0 || result.timeout_count > 0) {
+    std::cerr << "WARNING: " << result.failed_count << " failed, "
+              << result.timeout_count << " timeouts\n";
+  }
 
   const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())

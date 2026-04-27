@@ -487,44 +487,242 @@ cd rpc_project/build
 ctest --output-on-failure -R 'call_co_basic_test|call_co_out_of_order_test|call_co_timeout_test|call_co_close_test'
 ```
 
-## 12. Benchmark
+## 12. Benchmark（性能评估）
 
-提供两个最小 benchmark：
+本节介绍 RPC 框架的性能评估工具与结果解读方法。
 
-- `rpc_benchmark`：单连接基础延迟/吞吐
-- `rpc_thread_pool_benchmark`：慢 handler 场景下，对比 inline 执行与线程池执行
+### 12.1 Benchmark 概览
 
-`rpc_benchmark` 默认执行 1000 次 Add 调用，输出：
+本项目提供 4 个 benchmark 程序，用于评估 RPC 框架在不同场景下的性能：
 
-- 平均延迟（avg）
-- p95 延迟
-- 吞吐（qps）
+| 程序 | 定位 | 测什么 | 关注指标 |
+|------|------|--------|----------|
+| `rpc_benchmark` | 基础延迟与吞吐 | 单连接 baseline | QPS, avg, p95, p99 |
+| `rpc_benchmark_pipeline` | 单连接 pipeline | 单连接多 in-flight 能力 | QPS 提升, p95/p99 上升 |
+| `rpc_benchmark_conn_pool` | 多连接吞吐上限 | 多连接 × 每连接多 in-flight | QPS, tail latency |
+| `rpc_thread_pool_benchmark` | 线程池效果 | inline vs business thread pool | speedup ratio |
 
-运行示例：
+### 12.2 如何运行 Benchmark
 
-```bash
-cd rpc_project/build
-./rpc_benchmark 1000
-```
-
-`rpc_thread_pool_benchmark` 默认对比：
-- 场景 A：`business_thread_count=0`（inline handler）
-- 场景 B：`business_thread_count=4`（thread pool handler）
-
-运行示例：
+#### 构建项目
 
 ```bash
-cd rpc_project/build
-./rpc_thread_pool_benchmark 128 16 20
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-参数含义：
-- 第 1 个参数：总请求数
-- 第 2 个参数：并发客户端数
-- 第 3 个参数：慢 handler 的 sleep 毫秒数
+#### 运行全部 benchmark（推荐）
 
-输出会包含两种模式的 avg/p95/qps 以及 `qps_speedup`。
+```bash
+./scripts/run_benchmarks.sh build
+```
 
+这会自动运行推荐的 benchmark 组合：
+- A. baseline: `rpc_benchmark` (sync, 1k 请求)
+- B. pipeline: `rpc_benchmark_pipeline` (多 depth 扫描)
+- C. conn_pool: `rpc_benchmark_conn_pool` (多连接 × 多 depth)
+- D. thread_pool: `rpc_thread_pool_benchmark` (inline vs pool 对比)
+
+结果保存到 `benchmarks/results/` 目录。
+
+#### 单独运行某个 benchmark
+
+```bash
+# Baseline benchmark
+./build/rpc_benchmark --mode=sync --requests=5000 --concurrency=8
+
+# Pipeline benchmark (单 depth)
+./build/rpc_benchmark_pipeline --requests=50000 --depth=32
+
+# Connection pool benchmark (单测点)
+./build/rpc_benchmark_conn_pool --requests=100000 --conns=4 --depth=32
+
+# Thread pool benchmark
+./build/rpc_thread_pool_benchmark 128 16 20
+```
+
+#### 生成 Markdown 汇总
+
+```bash
+python3 scripts/summarize_benchmarks.py
+```
+
+输出 `benchmarks/results/summary.md`，包含所有结果的表格。
+
+### 12.3 指标说明
+
+#### QPS（Queries Per Second）
+
+```
+QPS = success_count / elapsed_seconds
+```
+
+注意：
+- 只用成功请求计算 QPS
+- 如果 `failed_count` 或 `timeout_count` 不为 0，结果需要谨慎解释
+- `failed_count > 0` 时这组数据不能直接说明吞吐能力
+
+#### Latency（延迟）
+
+- **avg**: 所有成功请求的平均端到端延迟（微秒）
+- **p50**: 50% 请求的延迟不超过此值
+- **p95/p99**: 95%/99% 请求的延迟不超过此值，反映尾延迟
+
+#### Connections / Depth
+
+- **connections**: 客户端并发连接数
+- **depth**: 每连接 in-flight（未完成）请求数
+
+### 12.4 每个 Benchmark 详解
+
+#### rpc_benchmark（基础延迟与吞吐）
+
+定位：baseline benchmark，测最基础的 RPC 调用延迟和吞吐。
+
+模型：
+- 启动内嵌服务端
+- 创建 N 个并发 client 线程
+- 每个线程使用 sync/async/coroutine 模式调用
+- 测量端到端延迟和 QPS
+
+参数：
+- `--mode=sync|async|co`: 调用模式（默认 sync）
+- `--requests=N`: 总请求数（默认 10000）
+- `--concurrency=N`: 客户端线程数（默认 8）
+- `--payload_bytes=N`: payload 大小（默认 128）
+
+```
+./build/rpc_benchmark --mode=sync --requests=5000 --concurrency=8
+```
+
+#### rpc_benchmark_pipeline（单连接多 in-flight）
+
+定位：测 `CallAsync + PendingCalls + request_id` 分发的价值。
+
+模型：
+- 单个 RpcClient，单条连接
+- 使用 CallAsync() 环形 pipeline 发请求
+- 控制 in-flight 窗口大小
+- 重点观察 depth 提高后 QPS 是否提升，p95/p99 是否上升
+
+参数：
+- `--requests=N`: 总请求数（默认 50000）
+- `--depth=N`: pipeline depth（默认自动扫描 1,8,32,64,128,256）
+- `--payload_bytes=N`: payload 大小（默认 64）
+
+```
+./build/rpc_benchmark_pipeline --requests=50000 --depth=32
+```
+
+#### rpc_benchmark_conn_pool（多连接吞吐上限）
+
+定位：测单连接是否成为瓶颈，多连接能否进一步提高吞吐。
+
+模型：
+- 创建 N 个 RpcClient，每个独占一条 TCP 连接
+- 每个连接使用 CallAsync() 环形 pipeline 发请求
+- 每连接 in-flight 深度固定
+- 总并发 = 连接数 × 每连接深度
+
+参数：
+- `--requests=N`: 总请求数（默认 50000）
+- `--conns=N`: 连接数（默认自动扫描 1,4,8,16）
+- `--depth=N`: 每连接 pipeline depth（默认自动扫描 8,16,32）
+
+```
+./build/rpc_benchmark_conn_pool --requests=100000 --conns=4 --depth=32
+```
+
+#### rpc_thread_pool_benchmark（线程池效果）
+
+定位：观察业务线程池是否能避免 I/O worker 被慢 handler 拖住。
+
+模型：
+- 场景 A：`business_thread_count=0`（inline handler，handler 在 worker 线程执行）
+- 场景 B：`business_thread_count=4`（thread pool handler，handler 在业务线程池执行）
+- 服务端 handler 模拟 sleep 延迟
+- 测量两种模式下的 QPS / avg / p95 / p99
+
+参数（位置参数）：
+- argv[1]: 总请求数（默认 128）
+- argv[2]: 并发客户端数（默认 16）
+- argv[3]: handler sleep 毫秒数（默认 20）
+
+```
+./build/rpc_thread_pool_benchmark 128 16 20
+```
+
+输出包含两种模式的统计以及 `qps_speedup`（thread pool QPS / inline QPS）。
+
+### 12.5 理解 Benchmark 结果
+
+#### 关注什么
+
+1. **QPS 是成功请求吞吐**：只统计成功请求，失败/超时请求不计入
+2. **avg latency 是平均延迟**：所有成功请求的平均值
+3. **p95/p99 是尾延迟**：反映长尾请求的延迟
+4. **failed_count > 0 时结果需要谨慎解释**：这组数据不能直接说明吞吐能力
+
+#### 常见问题
+
+1. **`depth` 提高后 QPS 提升但 p95/p99 也上升**：
+   - 这是正常的，pipeline 深度增加会提高吞吐但也会增加排队延迟
+   - 需要在吞吐和尾延迟之间做权衡
+
+2. **增加 connections 后 QPS 提升不明显**：
+   - 可能是服务端成了瓶颈（worker 数、线程池数不够）
+   - 可能是网络带宽限制
+
+3. **inline vs thread pool speedup < 1x**：
+   - 可能是 handler 太轻量（sleep 不足以体现线程池价值）
+   - 可能是并发太低（线程池优势需要一定并发量才能体现）
+
+### 12.6 测试环境说明模板
+
+运行 benchmark 前，建议记录环境信息，方便复现和对比：
+
+```text
+Environment:
+- CPU: <your_cpu_info>
+- OS: <your_os_version>
+- Compiler: <g++ --version>
+- Build type: Release
+- Protobuf: <version>
+- Server workers: <num>
+- Payload: <size> bytes
+```
+
+### 12.7 输出文件说明
+
+每次 benchmark 运行会产生独立的 timestamp 目录：
+
+```
+benchmarks/results/
+├── run_YYYYMMDD_HHMMSS/          # 每次运行的独立目录
+│   ├── baseline/                 # Baseline 结果
+│   │   └── rpc_benchmark_*.csv
+│   ├── pipeline/                 # Pipeline 结果
+│   │   └── rpc_benchmark_pipeline_*.csv
+│   ├── conn_pool/                # Connection pool 结果
+│   │   └── rpc_benchmark_conn_pool_*.csv
+│   ├── thread_pool/              # Thread pool 结果
+│   │   └── rpc_thread_pool_benchmark_*.csv
+│   └── summary.md                # Markdown 汇总（自动生成）
+└── ...
+```
+
+查看完整结果：
+
+```bash
+# 查看最近一次运行的汇总
+cat benchmarks/results/run_*/summary.md
+
+# 查看原始 CSV
+ls benchmarks/results/run_YYYYMMDD_HHMMSS/baseline/
+```
+
++++++++
+REPLACE
 ## 13. 客户端连接池与负载均衡（新增）
 
 ### 13.1 设计目标

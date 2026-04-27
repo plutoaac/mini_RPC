@@ -848,9 +848,14 @@ void FlushAsyncLogger() noexcept { AsyncLoggerEngine::Instance().Flush(); }
 
 void ShutdownAsyncLogger() noexcept { AsyncLoggerEngine::Instance().Shutdown(); }
 
-void SubmitAsyncLog(LogLevel level, std::string_view message,
-                    const std::source_location& location) noexcept {
-  AsyncLoggerEngine::Instance().Submit(level, message, location);
+// Fast path: kOff completely disables logging with zero overhead.
+// No formatting, no queue operations, no atomic increments.
+void SubmitAsyncLog(LogLevel level, std::string_view, const std::source_location&) noexcept {
+  if (level == LogLevel::kOff) [[unlikely]] {
+    return;  // Fast path: kOff means no logging at all
+  }
+  AsyncLoggerEngine::Instance().Submit(level, "", {});
 }
+
 
 }  // namespace rpc::common::detail

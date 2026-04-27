@@ -2,7 +2,9 @@
  * @file rpc_benchmark_conn_pool.cpp
  * @brief 多连接 × 每连接固定 in-flight 的吞吐上限 benchmark
  *
- * 目标：判断瓶颈是否在"单连接发送/接收路径"上。
+ * 定位：多连接 × 每连接固定 in-flight benchmark
+ * 测单连接是否成为瓶颈，多连接能否进一步提高吞吐
+ * 重点观察 connections 和 depth 对 QPS / tail latency 的影响
  *
  * 模型：
  *   - 创建 N 个 RpcClient，每个独占一条 TCP 连接
@@ -10,14 +12,9 @@
  *   - 每连接 in-flight 深度固定
  *   - 总并发 = 连接数 × 每连接深度
  *
- * 与已有 benchmark 的对照：
- *   - rpc_benchmark            ：多 client 串行同步/异步调用
- *   - rpc_benchmark_pipeline   ：单 client 多 in-flight
- *   - rpc_benchmark_conn_pool  ：多 client × 每连接多 in-flight
- *
  * 运行：
- *   ./rpc_benchmark_conn_pool                                  # 扫矩阵
- *   ./rpc_benchmark_conn_pool --conns=8 --depth=32 --requests=100000
+ *   ./rpc_benchmark_conn_pool                    # 自动扫描矩阵
+ *   ./rpc_benchmark_conn_pool --conns=4 --depth=32  # 固定单测点
  */
 
 #include <arpa/inet.h>
@@ -38,6 +35,7 @@
 
 #include "benchmark_stats.h"
 #include "client/rpc_client.h"
+#include "common/log.h"
 #include "server/rpc_server.h"
 #include "server/service_registry.h"
 
@@ -54,7 +52,7 @@ struct BenchOptions {
   /// 设为 0 表示扫矩阵；>0 表示固定值
   int fixed_conns{0};
   int fixed_depth{0};
-  std::string output_dir;
+  std::string output_dir{"benchmarks/results"};
 };
 
 struct BenchPoint {
@@ -99,6 +97,8 @@ bool ParseArgs(int argc, char** argv, BenchOptions* options) {
       options->fixed_depth = std::max(0, v);
     } else if (arg.rfind("--output_dir=", 0) == 0) {
       options->output_dir = arg.substr(13);
+    } else if (arg.rfind("--log=", 0) == 0) {
+      // log level handled in main, just accept the argument
     } else {
       std::cerr << "unknown arg: " << arg << "\n";
       return false;
@@ -108,7 +108,7 @@ bool ParseArgs(int argc, char** argv, BenchOptions* options) {
 }
 
 // ============================================================================
-// 辅助函数（与 rpc_benchmark.cpp 共用逻辑）
+// 辅助函数
 // ============================================================================
 
 bool CanConnect(std::uint16_t port) {
@@ -135,18 +135,12 @@ bool WaitServerReady(std::uint16_t port, std::chrono::milliseconds timeout) {
 
 // ============================================================================
 // 单连接 pipeline worker
-//
-// 环形缓冲区：大小为 depth。循环 total_per_conn 次，每次先回收旧 future
-// 再发新。 最后回收尾部未完成的 future。 返回值是
-// LocalStats，延迟从发送到收到之间的 RTT。
 // ============================================================================
 
-rpc::benchmark::LocalStats RunConnPipelineWorker(rpc::client::RpcClient* client,
-                                                 std::string_view service_name,
-                                                 std::string_view method_name,
-                                                 std::string_view payload,
-                                                 int depth,
-                                                 int total_per_conn) {
+rpc::benchmark::LocalStats RunConnPipelineWorker(
+    rpc::client::RpcClient* client, std::string_view service_name,
+    std::string_view method_name, std::string_view payload, int depth,
+    int total_per_conn) {
   rpc::benchmark::LocalStats stats;
   stats.latency_us.reserve(static_cast<std::size_t>(total_per_conn));
 
@@ -171,6 +165,8 @@ rpc::benchmark::LocalStats RunConnPipelineWorker(rpc::client::RpcClient* client,
 
       if (res.ok() && res.response_payload == payload) {
         ++stats.success_count;
+      } else if (res.status.message.find("timeout") != std::string::npos) {
+        ++stats.timeout_count;
       } else {
         ++stats.failed_count;
       }
@@ -196,6 +192,8 @@ rpc::benchmark::LocalStats RunConnPipelineWorker(rpc::client::RpcClient* client,
 
     if (res.ok() && res.response_payload == payload) {
       ++stats.success_count;
+    } else if (res.status.message.find("timeout") != std::string::npos) {
+      ++stats.timeout_count;
     } else {
       ++stats.failed_count;
     }
@@ -218,8 +216,7 @@ rpc::benchmark::BenchmarkResult RunPoint(std::uint16_t port,
   const int base = total_requests / connections;
   const int rem = total_requests % connections;
 
-  // 每个连接创建独立 RpcClient（用 unique_ptr，因为 RpcClient
-  // 不可拷贝不可移动）
+  // 每个连接创建独立 RpcClient
   std::vector<std::unique_ptr<rpc::client::RpcClient>> clients;
   clients.reserve(static_cast<std::size_t>(connections));
   for (int i = 0; i < connections; ++i) {
@@ -262,9 +259,10 @@ rpc::benchmark::BenchmarkResult RunPoint(std::uint16_t port,
   const auto end = std::chrono::steady_clock::now();
 
   // 聚合
-  rpc::benchmark::BenchmarkStats agg("conn_pool", connections,
-                                     static_cast<int>(payload.size()),
-                                     total_requests);
+  rpc::benchmark::BenchmarkStats agg("conn_pool", connections, depth,
+                                      connections,
+                                      static_cast<int>(payload.size()),
+                                      total_requests);
   for (auto& local : locals) {
     agg.Merge(std::move(local));
   }
@@ -277,38 +275,63 @@ rpc::benchmark::BenchmarkResult RunPoint(std::uint16_t port,
 // ============================================================================
 
 void PrintTableHeader() {
-  std::cout << std::left << std::setw(10) << "Conns" << std::right
-            << std::setw(10) << "Depth" << std::setw(10) << "Total"
-            << std::setw(10) << "OK" << std::setw(8) << "Fail" << std::setw(12)
-            << "Time(ms)" << std::setw(12) << "QPS" << std::setw(14)
-            << "Avg(us)" << std::setw(14) << "P50(us)" << std::setw(14)
-            << "P95(us)" << std::setw(14) << "P99(us)" << std::setw(14)
-            << "Max(us)"
+  std::cout << std::left << std::setw(8) << "Conns" << std::right
+            << std::setw(8) << "Depth" << std::setw(10) << "Total"
+            << std::setw(10) << "OK" << std::setw(8) << "Fail"
+            << std::setw(10) << "Timeout" << std::setw(12) << "Time(ms)"
+            << std::setw(12) << "QPS" << std::setw(14) << "Avg(us)"
+            << std::setw(14) << "P50(us)" << std::setw(14) << "P95(us)"
+            << std::setw(14) << "P99(us)" << std::setw(14) << "Max(us)"
             << "\n";
-  std::cout << std::string(140, '-') << "\n";
+  std::cout << std::string(150, '-') << "\n";
+}
+
+void PrintResult(const rpc::benchmark::BenchmarkResult& r, int connections,
+                 int depth) {
+  std::cout << std::left << std::setw(8) << connections << std::right
+            << std::setw(8) << depth << std::setw(10) << r.total_requests
+            << std::setw(10) << r.success_count << std::setw(8) << r.failed_count
+            << std::setw(10) << r.timeout_count << std::fixed
+            << std::setprecision(1) << std::setw(12) << r.total_time_ms
+            << std::setw(12) << std::setprecision(0) << r.qps
+            << std::setprecision(1) << std::setw(14) << r.avg_latency_us
+            << std::setw(14) << r.p50_latency_us << std::setw(14)
+            << r.p95_latency_us << std::setw(14) << r.p99_latency_us
+            << std::setw(14) << r.max_latency_us << "\n";
 }
 
 void PrintUsage() {
   std::cout << "usage: rpc_benchmark_conn_pool "
                "[--port=N] [--requests=N] [--conns=N] [--depth=N] "
                "[--payload_bytes=N] [--output_dir=PATH]\n"
-            << "  --conns=0 / --depth=0  自动扫矩阵 (默认)\n"
+            << "  --conns=0 / --depth=0  自动扫描矩阵 (默认)\n"
             << "  --conns=N --depth=N    固定单测点\n";
 }
 
+// ============================================================================
+// 入口
+// ============================================================================
+
 }  // namespace
 
-int main(int argc, char** argv) {
-  BenchOptions options;
-  // 自动检测输出目录
-  if (access("benchmarks/results", F_OK) == 0) {
-    options.output_dir = "benchmarks/results";
-  } else if (access("../benchmarks/results", F_OK) == 0) {
-    options.output_dir = "../benchmarks/results";
-  } else {
-    options.output_dir = ".";
+static rpc::common::LogLevel ParseLogArg(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg(argv[i]);
+    if (arg.rfind("--log=", 0) == 0) {
+      std::string val = arg.substr(6);
+      if (val == "off") return rpc::common::LogLevel::kOff;
+      if (val == "error") return rpc::common::LogLevel::kError;
+      if (val == "info") return rpc::common::LogLevel::kInfo;
+    }
   }
+  return rpc::common::LogLevel::kOff;  // Default to off for clean benchmarks
+}
 
+int main(int argc, char** argv) {
+  // Apply log level from --log argument (default: off)
+  rpc::common::SetLogLevel(ParseLogArg(argc, argv));
+
+  BenchOptions options;
   if (!ParseArgs(argc, argv, &options)) {
     PrintUsage();
     return 1;
@@ -372,44 +395,35 @@ int main(int argc, char** argv) {
   for (const auto& p : points) {
     auto r = RunPoint(options.port, "BenchmarkService", "Echo", payload,
                       p.connections, p.depth, options.total_requests);
+
+    // Check for failures
+    if (r.failed_count > 0 || r.timeout_count > 0) {
+      std::cerr << "WARNING: conns=" << p.connections << " depth=" << p.depth
+                << " has " << r.failed_count << " failed, " << r.timeout_count
+                << " timeouts\n";
+    }
+
     all_results.push_back(std::move(r));
-  }
-
-  // 格式化输出表格
-  for (size_t i = 0; i < points.size(); ++i) {
-    const auto& r = all_results[i];
-    const auto& p = points[i];
-
-    std::cout << std::left << std::setw(10) << p.connections << std::right
-              << std::setw(10) << p.depth << std::setw(10) << r.total_requests
-              << std::setw(10) << r.success_count << std::setw(8)
-              << r.failed_count << std::fixed << std::setprecision(1)
-              << std::setw(12) << r.total_time_ms << std::setw(12)
-              << std::setprecision(0) << r.qps << std::setprecision(1)
-              << std::setw(14) << r.avg_latency_us << std::setw(14)
-              << r.p50_latency_us << std::setw(14) << r.p95_latency_us
-              << std::setw(14) << r.p99_latency_us << std::setw(14)
-              << r.max_latency_us << "\n";
+    PrintResult(all_results.back(), p.connections, p.depth);
   }
 
   std::cout << "\n=== CSV ===\n";
-  std::cout << "conns,depth,total,ok,fail,time_ms,qps,avg_us,p50_us,p95_us,"
-               "p99_us,max_us\n";
+  std::cout << "conns,depth,total,ok,fail,timeout,time_ms,qps,avg_us,p50_us,"
+               "p95_us,p99_us,max_us\n";
   for (size_t i = 0; i < points.size(); ++i) {
     const auto& r = all_results[i];
     const auto& p = points[i];
     std::cout << p.connections << "," << p.depth << "," << r.total_requests
               << "," << r.success_count << "," << r.failed_count << ","
-              << std::fixed << std::setprecision(1) << r.total_time_ms << ","
-              << std::setprecision(0) << r.qps << "," << std::setprecision(1)
-              << r.avg_latency_us << "," << r.p50_latency_us << ","
-              << r.p95_latency_us << "," << r.p99_latency_us << ","
-              << r.max_latency_us << "\n";
+              << r.timeout_count << "," << std::fixed << std::setprecision(1)
+              << r.total_time_ms << "," << std::setprecision(0) << r.qps << ","
+              << std::setprecision(1) << r.avg_latency_us << ","
+              << r.p50_latency_us << "," << r.p95_latency_us << ","
+              << r.p99_latency_us << "," << r.max_latency_us << "\n";
   }
   std::cout << "\n";
 
   // ---------- 保存结果到文件 ----------
-  // 把每个测点写成一个独立文件（复用已有格式）
   for (size_t i = 0; i < points.size(); ++i) {
     const auto& r = all_results[i];
     const auto& p = points[i];

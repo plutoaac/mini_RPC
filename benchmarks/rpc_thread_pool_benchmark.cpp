@@ -1,3 +1,24 @@
+/**
+ * @file rpc_thread_pool_benchmark.cpp
+ * @brief 慢 handler 场景下 inline handler 与 business thread pool 的对比
+ *
+ * 定位：thread pool 效果 benchmark
+ * 重点观察业务线程池是否能避免 I/O worker 被慢 handler 拖住
+ *
+ * 模型：
+ *   - 场景 A：business_thread_count=0（inline handler，handler 在 worker 线程执行）
+ *   - 场景 B：business_thread_count=4（thread pool handler，handler 在业务线程池执行）
+ *   - 服务端 handler 模拟 sleep 延迟
+ *   - 测量两种模式下的 QPS / avg / p95 / p99
+ *
+ * 运行：
+ *   ./rpc_thread_pool_benchmark 128 16 20           # 默认参数
+ *   ./rpc_thread_pool_benchmark 500 8 50             # 自定义参数
+ *     argv[1]: total_requests (总请求数，默认 128)
+ *     argv[2]: concurrency (并发客户端数，默认 16)
+ *     argv[3]: handler_sleep_ms (handler 延迟毫秒，默认 20)
+ */
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,6 +38,7 @@
 #include "benchmark_stats.h"
 #include "calc.pb.h"
 #include "client/rpc_client.h"
+#include "common/log.h"
 #include "server/rpc_server.h"
 #include "server/service_registry.h"
 
@@ -101,8 +123,9 @@ rpc::benchmark::BenchmarkResult RunScenario(std::string name,
     std::abort();
   }
 
+  // connections=1, depth=1 for this benchmark (single client per scenario)
   rpc::benchmark::BenchmarkStats stats(
-      std::move(name), concurrency,
+      std::move(name), 1, 1, concurrency,
       static_cast<int>(BuildAddPayload(1, 2).size()), total_requests);
 
   const int base = total_requests / concurrency;
@@ -178,7 +201,35 @@ rpc::benchmark::BenchmarkResult RunScenario(std::string name,
 
 }  // namespace
 
+/**
+ * @brief Thread Pool Benchmark
+ *
+ * Compares inline handler vs thread pool handler performance.
+ *
+ * Usage:
+ *   ./rpc_thread_pool_benchmark [total_requests] [concurrency] [handler_sleep_ms]
+ *
+ * Default values:
+ *   total_requests: 128
+ *   concurrency: 16
+ *   handler_sleep_ms: 20
+ *
+ * Example:
+ *   ./rpc_thread_pool_benchmark 512 8 50
+ *
+ * This runs two scenarios:
+ *   - inline handler (business_thread_count=0): handler runs in I/O worker thread
+ *   - thread pool handler (business_thread_count=4): handler runs in business thread pool
+ *
+ * Expected output shows:
+ *   - QPS for both modes
+ *   - avg/p50/p95/p99 latency for both modes
+ *   - speedup ratio (pool QPS / inline QPS)
+ */
 int main(int argc, char** argv) {
+  // Disable logging during benchmark to avoid affecting performance
+  rpc::common::SetLogLevel(rpc::common::LogLevel::kError);
+
   const int total_requests =
       (argc > 1) ? std::max(32, std::atoi(argv[1])) : 128;
   const int concurrency = (argc > 2) ? std::max(2, std::atoi(argv[2])) : 16;
@@ -187,6 +238,11 @@ int main(int argc, char** argv) {
   const std::string output_dir =
       (argc > 4) ? std::string(argv[4]) : "benchmarks/results";
 
+  std::cout << "=== Thread Pool Benchmark ===\n";
+  std::cout << "total_requests=" << total_requests << "\n";
+  std::cout << "concurrency=" << concurrency << "\n";
+  std::cout << "handler_sleep_ms=" << handler_sleep_ms << "\n\n";
+
   const rpc::benchmark::BenchmarkResult inline_result =
       RunScenario("inline-handler", 50211, 2U, 0U, total_requests, concurrency,
                   handler_sleep_ms);
@@ -194,10 +250,23 @@ int main(int argc, char** argv) {
       RunScenario("thread-pool-handler", 50212, 2U, 4U, total_requests,
                   concurrency, handler_sleep_ms);
 
+  std::cout << "--- Inline Handler (business_thread_count=0) ---\n";
   rpc::benchmark::PrintBenchmarkResult(inline_result);
   rpc::benchmark::PrintBenchmarkCsv(inline_result);
+
+  std::cout << "\n--- Thread Pool Handler (business_thread_count=4) ---\n";
   rpc::benchmark::PrintBenchmarkResult(pool_result);
   rpc::benchmark::PrintBenchmarkCsv(pool_result);
+
+  // Check for failures
+  if (inline_result.failed_count > 0 || inline_result.timeout_count > 0) {
+    std::cerr << "WARNING: inline handler has " << inline_result.failed_count
+              << " failed, " << inline_result.timeout_count << " timeouts\n";
+  }
+  if (pool_result.failed_count > 0 || pool_result.timeout_count > 0) {
+    std::cerr << "WARNING: thread pool handler has " << pool_result.failed_count
+              << " failed, " << pool_result.timeout_count << " timeouts\n";
+  }
 
   const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
@@ -225,7 +294,8 @@ int main(int argc, char** argv) {
   }
 
   const double speedup = pool_result.qps / inline_result.qps;
-  std::cout << "qps_speedup=" << speedup << "x\n";
+  std::cout << "\nqps_speedup=" << speedup << "x\n";
+  std::cout << "(thread pool / inline handler)\n";
 
   return 0;
 }

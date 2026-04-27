@@ -11,9 +11,12 @@
 
 namespace rpc::benchmark {
 
-BenchmarkStats::BenchmarkStats(std::string mode, int concurrency,
-                               int payload_bytes, int total_requests)
+BenchmarkStats::BenchmarkStats(std::string mode, int connections, int depth,
+                                int concurrency, int payload_bytes,
+                                int total_requests)
     : mode_(std::move(mode)),
+      connections_(connections),
+      depth_(depth),
       concurrency_(concurrency),
       payload_bytes_(payload_bytes),
       total_requests_(total_requests) {
@@ -38,6 +41,8 @@ BenchmarkResult BenchmarkStats::Finalize(
 
   BenchmarkResult result;
   result.mode = mode_;
+  result.connections = connections_;
+  result.depth = depth_;
   result.concurrency = concurrency_;
   result.payload_bytes = payload_bytes_;
   result.total_requests = total_requests_;
@@ -49,6 +54,8 @@ BenchmarkResult BenchmarkStats::Finalize(
       std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
           .count();
   result.total_time_ms = static_cast<double>(elapsed_us) / 1000.0;
+
+  // QPS calculation: only count successful requests
   if (elapsed_us > 0) {
     result.qps = (1e6 * static_cast<double>(result.success_count)) /
                  static_cast<double>(elapsed_us);
@@ -99,6 +106,8 @@ void PrintBenchmarkCsv(const BenchmarkResult& result) {
 std::string BenchmarkResultToText(const BenchmarkResult& result) {
   std::ostringstream oss;
   oss << "mode=" << result.mode << '\n';
+  oss << "connections=" << result.connections << '\n';
+  oss << "depth=" << result.depth << '\n';
   oss << "concurrency=" << result.concurrency << '\n';
   oss << "payload_bytes=" << result.payload_bytes << '\n';
   oss << "total_requests=" << result.total_requests << '\n';
@@ -117,8 +126,9 @@ std::string BenchmarkResultToText(const BenchmarkResult& result) {
 
 std::string BenchmarkResultToCsv(const BenchmarkResult& result) {
   std::ostringstream oss;
-  oss << result.mode << ',' << result.concurrency << ',' << result.payload_bytes
-      << ',' << result.total_requests << ',' << result.success_count << ','
+  oss << result.mode << ',' << result.connections << ',' << result.depth << ','
+      << result.concurrency << ',' << result.payload_bytes << ','
+      << result.total_requests << ',' << result.success_count << ','
       << result.failed_count << ',' << result.timeout_count << ','
       << result.total_time_ms << ',' << result.qps << ','
       << result.avg_latency_us << ',' << result.p50_latency_us << ','
@@ -157,9 +167,10 @@ bool WriteBenchmarkResultFiles(const BenchmarkResult& result,
     if (!out.is_open()) {
       return false;
     }
-    out << "mode,concurrency,payload_bytes,total_requests,success_count,failed_"
-           "count,timeout_count,total_time_ms,qps,avg_latency_us,p50_latency_"
-           "us,p95_latency_us,p99_latency_us,max_latency_us\n";
+    out << "mode,connections,depth,concurrency,payload_bytes,total_requests,"
+           "success_count,failed_count,timeout_count,total_time_ms,qps,"
+           "avg_latency_us,p50_latency_us,p95_latency_us,p99_latency_us,"
+           "max_latency_us\n";
     out << BenchmarkResultToCsv(result) << '\n';
   }
 
