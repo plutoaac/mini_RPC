@@ -18,3 +18,13 @@ Makefile
 
 # Benchmark generated outputs
 benchmarks/results/
+
+# Additional Build and Output Artifacts
+build*/
+Testing/
+*.log
+*.suo
+*.user
+*.vscode/
+compile_commands.json
+
