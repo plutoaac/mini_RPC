@@ -21,6 +21,7 @@
 #   ├── baseline/
 #   ├── pipeline/
 #   ├── conn_pool/
+#   ├── client_pool/
 #   ├── thread_pool/
 #   └── summary.md
 
@@ -66,6 +67,7 @@ check_executable() {
 mkdir -p "$RESULTS_DIR/baseline"
 mkdir -p "$RESULTS_DIR/pipeline"
 mkdir -p "$RESULTS_DIR/conn_pool"
+mkdir -p "$RESULTS_DIR/client_pool"
 mkdir -p "$RESULTS_DIR/thread_pool"
 
 echo "Results will be saved to: $RESULTS_DIR"
@@ -151,32 +153,26 @@ LOG_LEVEL="$LOG_LEVEL" "$THREAD_POOL_BIN" 1024 16 20 "$RESULTS_DIR/thread_pool"
 echo ""
 
 # =============================================
-# E. Optional: Log overhead comparison
+# E. RpcClientPool Benchmark (测试不同分发策略)
 # =============================================
-if [[ "${RUN_LOG_COMPARISON:-no}" == "yes" ]]; then
-    echo "=========================================="
-    echo "E. Log Overhead Comparison (optional)"
-    echo "=========================================="
-    echo ""
-    echo "Running conn_pool with --log=info to measure logging overhead..."
-    echo ""
+echo "=========================================="
+echo "E. RpcClientPool Benchmark (shared pool)"
+echo "=========================================="
+CLIENT_POOL_BIN="$BUILD_DIR/rpc_client_pool_benchmark"
+check_executable "$CLIENT_POOL_BIN"
 
-    echo "--- with --log=info ---"
-    "$CONN_POOL_BIN" --requests=50000 --conns=4 --depth=32 --payload_bytes=64 --log=info --output_dir="$RESULTS_DIR"
+echo "--- scenario=round_robin, requests=50000 ---"
+"$CLIENT_POOL_BIN" --scenario=round_robin --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir="$RESULTS_DIR/client_pool"
 
-    echo ""
-    echo "--- with --log=off ---"
-    "$CONN_POOL_BIN" --requests=50000 --conns=4 --depth=32 --payload_bytes=64 --log=off --output_dir="$RESULTS_DIR"
+echo ""
+echo "--- scenario=least_inflight, requests=50000 ---"
+"$CLIENT_POOL_BIN" --scenario=least_inflight --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir="$RESULTS_DIR/client_pool"
 
-    echo ""
-    echo "Compare QPS results to understand logging overhead."
-else
-    echo "=========================================="
-    echo "E. Log Overhead Comparison (skipped)"
-    echo "=========================================="
-    echo "To run log comparison: RUN_LOG_COMPARISON=yes ./scripts/run_benchmarks.sh"
-    echo ""
-fi
+echo ""
+echo "--- scenario=round_robin, requests=100000 ---"
+"$CLIENT_POOL_BIN" --scenario=round_robin --requests=100000 --payload_bytes=64 --concurrency=16 --output_dir="$RESULTS_DIR/client_pool"
+
+echo ""
 
 # =============================================
 # 生成 summary
@@ -201,6 +197,7 @@ echo "  1. Check raw results:"
 echo "     ls $RESULTS_DIR/baseline/"
 echo "     ls $RESULTS_DIR/pipeline/"
 echo "     ls $RESULTS_DIR/conn_pool/"
+echo "     ls $RESULTS_DIR/client_pool/"
 echo "     ls $RESULTS_DIR/thread_pool/"
 echo "  2. View summary: cat $RESULTS_DIR/summary.md"
 echo ""

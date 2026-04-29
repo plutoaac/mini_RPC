@@ -200,6 +200,9 @@
 ### 依赖
 
 请先安装：
+
+
+
 - `cmake`
 - `g++`（支持 C++20）
 - `protobuf` 与 `protoc`
@@ -493,16 +496,33 @@ ctest --output-on-failure -R 'call_co_basic_test|call_co_out_of_order_test|call_
 
 ### 12.1 Benchmark 概览
 
-本项目提供 4 个 benchmark 程序，用于评估 RPC 框架在不同场景下的性能：
+本项目提供 5 个 benchmark 程序，用于评估 RPC 框架在不同场景下的性能：
 
 | 程序 | 定位 | 测什么 | 关注指标 |
 |------|------|--------|----------|
 | `rpc_benchmark` | 基础延迟与吞吐 | 单连接 baseline | QPS, avg, p95, p99 |
 | `rpc_benchmark_pipeline` | 单连接 pipeline | 单连接多 in-flight 能力 | QPS 提升, p95/p99 上升 |
-| `rpc_benchmark_conn_pool` | 多连接吞吐上限 | 多连接 × 每连接多 in-flight | QPS, tail latency |
+| `rpc_benchmark_conn_pool` | Manual Multi-Client | 多长连接 × 每连接多 in-flight | QPS, tail latency |
+| `rpc_client_pool_benchmark` | RpcClientPool | RoundRobin/LeastInflight/Failover | 分发比例, health |
 | `rpc_thread_pool_benchmark` | 线程池效果 | inline vs business thread pool | speedup ratio |
 
-### 12.2 如何运行 Benchmark
+> **说明**：所有 benchmark 均显式关闭 heartbeat（`heartbeat_interval=0`），避免后台 tick、心跳请求和心跳日志污染 QPS/latency 结果。
+
+### 12.2 RpcClient 长连接说明
+
+`RpcClient` 使用 **lazy connect + persistent connection** 模型：
+
+- 第一次调用 `Connect()` 建立 TCP 连接
+- 如果 `sock_` 已存在，后续 `Connect()` 直接返回 true
+- 后续 `Call / CallAsync / CallCo` 复用同一条 TCP 连接
+- 通过 `request_id` 支持同一连接上的多个 in-flight 请求
+
+这意味着：
+- 单个 `RpcClient` 可以通过 pipeline 方式发送多个 in-flight 请求
+- `rpc_benchmark_conn_pool` 手动创建多个 `RpcClient`，每个独占一条长连接
+- `rpc_client_pool_benchmark` 使用 `RpcClientPool` 统一管理多个 endpoint
+
+### 12.3 如何运行 Benchmark
 
 #### 构建项目
 
@@ -549,7 +569,7 @@ python3 scripts/summarize_benchmarks.py
 
 输出 `benchmarks/results/summary.md`，包含所有结果的表格。
 
-### 12.3 指标说明
+### 12.4 指标说明
 
 #### QPS（Queries Per Second）
 
@@ -573,7 +593,7 @@ QPS = success_count / elapsed_seconds
 - **connections**: 客户端并发连接数
 - **depth**: 每连接 in-flight（未完成）请求数
 
-### 12.4 每个 Benchmark 详解
+### 12.5 每个 Benchmark 详解
 
 #### rpc_benchmark（基础延迟与吞吐）
 
@@ -654,7 +674,62 @@ QPS = success_count / elapsed_seconds
 
 输出包含两种模式的统计以及 `qps_speedup`（thread pool QPS / inline QPS）。
 
-### 12.5 理解 Benchmark 结果
+#### rpc_client_pool_benchmark（RpcClientPool 负载均衡）
+
+定位：展示 `RpcClientPool` 负载均衡模块的作用，重点观察分发比例、健康状态、故障转移。
+
+模型：
+- 启动多个 endpoint server
+- 创建 `RpcClientPool` 配置 RoundRobin / LeastInflight 策略
+- 多线程并发发送请求
+- 观察 endpoint 分发比例和健康状态
+
+场景：
+
+1. **round_robin**：展示 RoundRobin 分发到 3 个 endpoint
+2. **least_inflight**：展示 LeastInflight 在有慢节点时的倾向避让
+3. **failover**：展示故障转移和健康检查
+
+参数：
+- `--scenario=round_robin|least_inflight|failover`: 场景选择（默认 round_robin）
+- `--requests=N`: 总请求数（默认 30000）
+- `--payload_bytes=N`: payload 大小（默认 64）
+- `--concurrency=N`: 并发数（默认 8）
+
+```
+# RoundRobin 分发
+./build/rpc_client_pool_benchmark --scenario=round_robin --requests=30000 --payload_bytes=64
+
+# LeastInflight 倾向避让
+./build/rpc_client_pool_benchmark --scenario=least_inflight --requests=30000 --payload_bytes=64
+
+# Failover 故障转移
+./build/rpc_client_pool_benchmark --scenario=failover --requests=1000 --payload_bytes=64
+```
+
+输出示例：
+```
+=== RpcClientPool Benchmark: round_robin ===
+requests=30000 payload=64 bytes
+
+QPS=...
+Avg(us)=...
+P95(us)=...
+P99(us)=...
+
+Endpoint stats:
+endpoint              select  success  fail  inflight  healthy
+127.0.0.1:50301       10000   10000    0     0         true
+127.0.0.1:50302       10000   10000    0     0         true
+127.0.0.1:50303       10000   10000    0     0         true
+
+Distribution:
+  127.0.0.1:50301: 33.3%
+  127.0.0.1:50302: 33.3%
+  127.0.0.1:50303: 33.3%
+```
+
+### 12.6 理解 Benchmark 结果
 
 #### 关注什么
 
@@ -677,7 +752,7 @@ QPS = success_count / elapsed_seconds
    - 可能是 handler 太轻量（sleep 不足以体现线程池价值）
    - 可能是并发太低（线程池优势需要一定并发量才能体现）
 
-### 12.6 测试环境说明模板
+### 12.7 测试环境说明模板
 
 运行 benchmark 前，建议记录环境信息，方便复现和对比：
 
@@ -692,7 +767,7 @@ Environment:
 - Payload: <size> bytes
 ```
 
-### 12.7 输出文件说明
+### 12.8 输出文件说明
 
 每次 benchmark 运行会产生独立的 timestamp 目录：
 

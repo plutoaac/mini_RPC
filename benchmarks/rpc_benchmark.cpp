@@ -297,7 +297,9 @@ rpc::benchmark::BenchmarkResult RunBenchmark(const BenchmarkOptions& options) {
     rpc::client::RpcClient warmup_client(
         "127.0.0.1", options.port,
         {.send_timeout = std::chrono::milliseconds(3000),
-         .recv_timeout = std::chrono::milliseconds(3000)});
+         .recv_timeout = std::chrono::milliseconds(3000),
+         .heartbeat_interval = std::chrono::seconds(0),
+         .heartbeat_timeout = std::chrono::seconds(0)});
     const std::string warmup_payload = BuildPayload(options.payload_bytes);
     for (int i = 0; i < 5; ++i) {
       [[maybe_unused]] auto _ = warmup_client.Call("BenchmarkService", "Echo",
@@ -326,7 +328,9 @@ rpc::benchmark::BenchmarkResult RunBenchmark(const BenchmarkOptions& options) {
       rpc::client::RpcClient client(
           "127.0.0.1", options.port,
           {.send_timeout = std::chrono::milliseconds(3000),
-           .recv_timeout = std::chrono::milliseconds(3000)});
+           .recv_timeout = std::chrono::milliseconds(3000),
+           .heartbeat_interval = std::chrono::seconds(0),
+           .heartbeat_timeout = std::chrono::seconds(0)});
 
       if (options.mode == BenchMode::kSync) {
         locals[static_cast<std::size_t>(i)] =

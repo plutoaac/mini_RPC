@@ -84,33 +84,19 @@ std::string ServiceRegistry::BuildKey(std::string_view service_name,
  * @return false 注册失败（参数无效或键已存在）
  */
 bool ServiceRegistry::Register(std::string_view service_name,
-                               std::string_view method_name, Handler handler) {
-  // ===== 参数验证 =====
-  // 检查服务名、方法名是否为空
-  // 检查 handler 是否有效（operator bool 返回 true 表示可调用）
+                                std::string_view method_name, Handler handler) {
   if (service_name.empty() || method_name.empty() || !handler) {
     return false;
   }
 
-  // ===== 加锁保护 =====
-  // 使用 scoped_lock 加锁，保证并发安全
-  // 注册表可能在并发场景下访问，统一加锁保护
   std::scoped_lock lock(mutex_);
 
-  // 构建存储键
   const std::string key = BuildKey(service_name, method_name);
 
-  // ===== 检查重复 =====
-  // 使用 contains() 检查键是否已存在（C++20）
-  // 如果已存在，拒绝重复注册
   if (handlers_.contains(key)) {
     return false;
   }
 
-  // ===== 插入映射 =====
-  // 使用 emplace 插入新键值对
-  // std::move(handler) 移动 handler 避免复制
-  // emplace 返回 pair<iterator, bool>，second 表示是否插入成功
   return handlers_.emplace(key, std::move(handler)).second;
 }
 
@@ -145,27 +131,16 @@ bool ServiceRegistry::Register(std::string_view service_name,
  */
 std::optional<std::reference_wrapper<const Handler>> ServiceRegistry::Find(
     std::string_view service_name, std::string_view method_name) const {
-  // ===== 加锁保护 =====
-  // 查找与注册共享同一把锁，保证线程安全
-  // 使用 scoped_lock 确保异常安全
   std::scoped_lock lock(mutex_);
 
-  // 构建查找键
   const std::string key = BuildKey(service_name, method_name);
 
-  // 在映射表中查找
-  // find() 返回迭代器，end() 表示未找到
   const auto it = handlers_.find(key);
 
-  // 检查是否找到
   if (it == handlers_.end()) {
-    // 未找到，返回空的 optional
     return std::nullopt;
   }
 
-  // 找到，返回处理函数的常量引用包装器
-  // std::cref 创建对 Handler 的 const 引用包装器
-  // it->second 是 Handler 对象
   return std::cref(it->second);
 }
 

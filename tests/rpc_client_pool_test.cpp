@@ -54,13 +54,18 @@ std::string MakeAddPayload(int a, int b) {
   req.set_a(a);
   req.set_b(b);
   std::string payload;
-  assert(req.SerializeToString(&payload));
+  if (!req.SerializeToString(&payload)) {
+    std::cerr << "FATAL: MakeAddPayload SerializeToString failed\n";
+  }
   return payload;
 }
 
 int ParseAddResult(const std::string& payload) {
   calc::AddResponse resp;
-  assert(resp.ParseFromString(payload));
+  if (!resp.ParseFromString(payload)) {
+    std::cerr << "ParseAddResult: ParseFromString failed, payload size=" << payload.size() << "\n";
+    return -1;
+  }
   return resp.result();
 }
 
@@ -76,12 +81,37 @@ struct EmbeddedServer {
   bool started = false;
 
   EmbeddedServer(std::uint16_t p,
-                 std::function<std::string(std::string_view)> handler)
+                 std::function<std::string(std::string_view)> handler,
+                 std::size_t bt = 2)
       : port(p) {
-    assert(registry.Register("CalcService", "Add", std::move(handler)));
-    server = std::make_unique<rpc::server::RpcServer>(port, registry, 2);
+    if (!registry.Register("CalcService", "Add", std::move(handler))) {
+      std::cerr << "FATAL: failed to register CalcService.Add on port " << port << "\n";
+      return;
+    }
+    server = std::make_unique<rpc::server::RpcServer>(port, registry, 2, bt);
     thread = std::thread([this]() { started = server->Start(); });
-    assert(WaitServerReady(port, std::chrono::seconds(3)));
+    if (!WaitServerReady(port, std::chrono::seconds(3))) {
+      std::cerr << "FATAL: server on port " << port << " failed to become ready\n";
+      return;
+    }
+    // 用真正的 RPC 请求验证服务完全就绪
+    bool ready = false;
+    for (int retry = 0; retry < 30 && !ready; ++retry) {
+      rpc::client::RpcClient probe(
+          "127.0.0.1", port,
+          {.send_timeout = std::chrono::milliseconds(1000),
+           .recv_timeout = std::chrono::milliseconds(1000)});
+      auto res = probe.Call("CalcService", "Add", MakeAddPayload(1, 2));
+      if (res.ok()) {
+        ready = true;
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+    }
+    if (!ready) {
+      std::cerr << "FATAL: server on port " << port << " never responded to health probe\n";
+      return;
+    }
   }
 
   void Stop() {
@@ -429,12 +459,18 @@ bool TestFailoverAndRetryExclusion() {
           .strategy = rpc::client::LoadBalanceStrategy::kRoundRobin,
           .max_consecutive_failures = 2});
 
-  assert(pool.Warmup());
+  if (!pool.Warmup()) {
+    std::cerr << "Failover: Warmup failed\n";
+    return false;
+  }
 
   // 先发几次请求，确保两个 client 都已连接
   for (int i = 0; i < 4; ++i) {
     auto res = pool.Call("CalcService", "Add", MakeAddPayload(1, 2));
-    assert(res.ok());
+    if (!res.ok()) {
+      std::cerr << "Failover: initial call " << i << " failed: " << res.status.message << "\n";
+      return false;
+    }
   }
 
   // 关掉 server1
@@ -717,7 +753,10 @@ bool TestBusinessErrorNotUnhealthy() {
           .strategy = rpc::client::LoadBalanceStrategy::kRoundRobin,
           .max_consecutive_failures = 1});
 
-  assert(pool.Warmup());
+  if (!pool.Warmup()) {
+    std::cerr << "Business error test: Warmup failed\n";
+    return false;
+  }
 
   // 调用不存在的方法，应返回 METHOD_NOT_FOUND（业务错误）
   auto res = pool.Call("CalcService", "NoSuchMethod", MakeAddPayload(1, 2));

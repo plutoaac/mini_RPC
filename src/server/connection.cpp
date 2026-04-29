@@ -1042,19 +1042,19 @@ bool Connection::HandleOneRequest(const rpc::RpcRequest& request,
     return true;
   } catch (const RpcError& ex) {
     // RPC 业务错误
-    response->set_error_code(common::ToProtoErrorCode(ex.code()));
+    response->set_error_code(static_cast<rpc::ErrorCode>(common::ToProtoErrorCode(ex.code())));
     response->set_error_msg(ex.what());
     return true;
   } catch (const std::exception& ex) {
     // 标准异常
-    response->set_error_code(common::ToProtoErrorCode(
-        common::make_error_code(common::ErrorCode::kInternalError)));
+    response->set_error_code(static_cast<rpc::ErrorCode>(common::ToProtoErrorCode(
+        common::make_error_code(common::ErrorCode::kInternalError))));
     response->set_error_msg(std::string("handler exception: ") + ex.what());
     return true;
   } catch (...) {
     // 未知异常
-    response->set_error_code(common::ToProtoErrorCode(
-        common::make_error_code(common::ErrorCode::kInternalError)));
+    response->set_error_code(static_cast<rpc::ErrorCode>(common::ToProtoErrorCode(
+        common::make_error_code(common::ErrorCode::kInternalError))));
     response->set_error_msg("handler threw unknown exception");
     return true;
   }

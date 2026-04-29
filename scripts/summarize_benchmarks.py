@@ -467,6 +467,61 @@ def generate_summary(results_dir: str) -> str:
     else:
         sections.append("*无数据*\n\n")
 
+    # RpcClientPool Benchmark
+    sections.append("## 5. RpcClientPool Benchmark (rpc_client_pool_benchmark)\n\n")
+    sections.append("共享连接池 + 负载均衡策略测试，观察不同分发策略对 QPS 和尾延迟的影响。\n\n")
+    csv_files = collect_csv_files(results_dir, "client_pool")
+    if csv_files:
+        rows = []
+        for f in csv_files:
+            data = read_csv(f)
+            if not data:
+                continue
+            # 支持多种格式
+            if 'scenario' in data:
+                # 格式1: scenario,suc_count,fail_count,...
+                required = ['scenario', 'suc_count', 'fail_count', 'total_time', 'avg_lat', 'p50_lat', 'p95_lat', 'p99_lat']
+                if not check_fields(data, required):
+                    continue
+                total = safe_int(data['suc_count']) + safe_int(data['fail_count'])
+                elapsed = safe_float(data['total_time']) / 1000.0  # ms to s
+                qps = safe_int(data['suc_count']) / elapsed if elapsed > 0 else 0
+                rows.append([
+                    data['scenario'],
+                    str(total),
+                    data['suc_count'],
+                    data['fail_count'],
+                    f"{qps:.2f}",
+                    f"{safe_float(data['avg_lat']):.2f}",
+                    f"{safe_float(data['p95_lat']):.2f}",
+                    f"{safe_float(data['p99_lat']):.2f}"
+                ])
+            elif 'concurrency' in data:
+                # 格式2: concurrency,total_requests,...
+                required = ['concurrency', 'total_requests', 'success_count', 'failed_count',
+                            'qps', 'avg_latency_us', 'p95_latency_us', 'p99_latency_us']
+                if not check_fields(data, required):
+                    continue
+                rows.append([
+                    data.get('scenario', 'round_robin'),
+                    data['total_requests'],
+                    data['success_count'],
+                    data['failed_count'],
+                    f"{safe_float(data['qps']):.2f}",
+                    f"{safe_float(data['avg_latency_us']):.2f}",
+                    f"{safe_float(data['p95_latency_us']):.2f}",
+                    f"{safe_float(data['p99_latency_us']):.2f}"
+                ])
+        if rows:
+            sections.append(render_table(
+                ['Scenario', 'Requests', 'Success', 'Failed', 'QPS', 'Avg(us)', 'P95(us)', 'P99(us)'],
+                rows
+            ))
+        else:
+            sections.append("*无有效数据*\n\n")
+    else:
+        sections.append("*无数据*\n\n")
+
     # 快速参考
     sections.append("## 快速参考：每个 Benchmark 测什么\n\n")
     sections.append("| Benchmark | 测什么 | 关键参数 | 关注指标 |\n")
@@ -474,6 +529,7 @@ def generate_summary(results_dir: str) -> str:
     sections.append("| rpc_benchmark | 基础延迟与吞吐 | mode (sync/async/co), concurrency | QPS, avg, p95 |\n")
     sections.append("| rpc_benchmark_pipeline | 单连接 pipeline 能力 | depth (in-flight 数量) | QPS 提升, p95/p99 上升 |\n")
     sections.append("| rpc_benchmark_conn_pool | 多连接吞吐上限 | conns, depth | QPS, tail latency |\n")
+    sections.append("| rpc_client_pool_benchmark | 连接池负载均衡策略 | scenario (round_robin/least_inflight) | QPS, p95/p99 |\n")
     sections.append("| rpc_thread_pool_benchmark | 线程池解耦效果 | handler_sleep_ms | speedup ratio |\n")
 
     return "".join(sections)

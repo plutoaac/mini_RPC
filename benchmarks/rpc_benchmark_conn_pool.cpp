@@ -1,13 +1,25 @@
 /**
  * @file rpc_benchmark_conn_pool.cpp
- * @brief 多连接 × 每连接固定 in-flight 的吞吐上限 benchmark
+ * @brief Manual Multi-Client Benchmark：多连接 × 每连接固定 in-flight 的吞吐上限
  *
- * 定位：多连接 × 每连接固定 in-flight benchmark
- * 测单连接是否成为瓶颈，多连接能否进一步提高吞吐
- * 重点观察 connections 和 depth 对 QPS / tail latency 的影响
+ * 定位：
+ *   此 benchmark 展示"多长连接 + 多 in-flight"的吞吐上限，
+ *   用于观察多连接是否突破单连接瓶颈。
+ *
+ *   重要说明：
+ *   - 本 benchmark 不使用 RpcClientPool，不测试负载均衡策略
+ *   - 本 benchmark 手动创建多个 RpcClient，每个独占一条长连接
+ *   - 每个连接使用 pipeline 方式发送多个 in-flight 请求
+ *
+ * RpcClient 长连接说明：
+ *   RpcClient 使用 lazy connect + persistent connection：
+ *   - 第一次调用 Connect() 建立 TCP 连接
+ *   - 如果 sock_ 已存在，后续 Connect() 直接返回 true
+ *   - 后续 Call / CallAsync / CallCo 复用同一条 TCP 连接
+ *   - 通过 request_id 支持同一连接上的多个 in-flight 请求
  *
  * 模型：
- *   - 创建 N 个 RpcClient，每个独占一条 TCP 连接
+ *   - 创建 N 个 RpcClient，每个独占一条 TCP 长连接
  *   - 每个连接使用 CallAsync() 环形 pipeline 发请求
  *   - 每连接 in-flight 深度固定
  *   - 总并发 = 连接数 × 每连接深度
@@ -224,7 +236,9 @@ rpc::benchmark::BenchmarkResult RunPoint(std::uint16_t port,
         "127.0.0.1", port,
         rpc::client::RpcClientOptions{
             .send_timeout = std::chrono::milliseconds(5000),
-            .recv_timeout = std::chrono::milliseconds(5000)}));
+            .recv_timeout = std::chrono::milliseconds(5000),
+            .heartbeat_interval = std::chrono::seconds(0),
+            .heartbeat_timeout = std::chrono::seconds(0)}));
   }
 
   // 预热（每个连接发 3 个请求）
@@ -383,9 +397,9 @@ int main(int argc, char** argv) {
   }
 
   // ---------- 运行 ----------
-  std::cout << "\n=== Connection Pool Benchmark: "
+  std::cout << "\n=== Manual Multi-Client Benchmark: "
             << "requests=" << options.total_requests
-            << ", payload=" << payload.size() << " bytes ===\n\n";
+            << ", payload=" << payload.size() << " bytes, heartbeat=disabled ===\n\n";
 
   PrintTableHeader();
 

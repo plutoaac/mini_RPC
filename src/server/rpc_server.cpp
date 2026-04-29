@@ -52,6 +52,17 @@ bool RpcServer::InitAcceptor(std::string* error_msg) {
     return false;
   }
 
+#ifdef SO_REUSEPORT
+  if (::setsockopt(listen_fd_.Get(), SOL_SOCKET, SO_REUSEPORT, &reuse,
+                   sizeof(reuse)) < 0) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("setsockopt(SO_REUSEPORT) failed: ") +
+                   std::strerror(errno);
+    }
+    return false;
+  }
+#endif
+
   const int listen_flags = ::fcntl(listen_fd_.Get(), F_GETFL, 0);
   if (listen_flags < 0 ||
       ::fcntl(listen_fd_.Get(), F_SETFL, listen_flags | O_NONBLOCK) < 0) {

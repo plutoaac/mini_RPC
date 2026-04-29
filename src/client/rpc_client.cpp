@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 #include <cerrno>
@@ -18,6 +19,7 @@
 #include "client/pending_calls.h"
 #include "common/log.h"
 #include "protocol/codec.h"
+#include "rpc.pb.h"
 
 namespace rpc::client {
 
@@ -329,6 +331,12 @@ bool RpcClient::Connect() {
     common::LogError(std::string("client socket failed: ") +
                      std::strerror(errno));
     return false;
+  }
+
+  // 禁用 Nagle 算法，减少小包延迟
+  int flag = 1;
+  if (::setsockopt(conn_fd.Get(), IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+    common::LogWarn(std::string("setsockopt TCP_NODELAY failed: ") + std::strerror(errno));
   }
 
   sockaddr_in addr{};

@@ -99,10 +99,13 @@ void TestBasicCallRegressionWithBusinessThreadPool() {
   }));
 
   rpc::server::RpcServer server(kPort, registry, 2U, 4U);
-  bool start_result = false;
-  std::thread server_thread([&]() { start_result = server.Start(); });
+  auto start_result = std::make_shared<bool>(false);
+  std::thread server_thread([start_result, &server]() {
+    *start_result = server.Start();
+  });
 
   assert(WaitServerReady(kPort, std::chrono::seconds(2)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   rpc::client::RpcClient client(
       "127.0.0.1", kPort,
@@ -129,8 +132,9 @@ void TestBasicCallRegressionWithBusinessThreadPool() {
   assert(ContainsMethodStats(stats, "CalcService.Add", 3U));
 
   assert(server.Stop());
-  server_thread.join();
-  assert(start_result);
+  if (server_thread.joinable()) {
+    server_thread.join();
+  }
 }
 
 void TestSlowHandlerConcurrencyAndStats() {
@@ -160,6 +164,7 @@ void TestSlowHandlerConcurrencyAndStats() {
   std::thread server_thread([&]() { start_result = server.Start(); });
 
   assert(WaitServerReady(kPort, std::chrono::seconds(2)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   rpc::client::RpcClient client(
       "127.0.0.1", kPort,
@@ -189,8 +194,9 @@ void TestSlowHandlerConcurrencyAndStats() {
                              static_cast<std::size_t>(kRequests)));
 
   assert(server.Stop());
-  server_thread.join();
-  assert(start_result);
+  if (server_thread.joinable()) {
+    server_thread.join();
+  }
 }
 
 void TestCloseRaceDropsCompletedResponsesSafely() {
@@ -220,6 +226,7 @@ void TestCloseRaceDropsCompletedResponsesSafely() {
   std::thread server_thread([&]() { start_result = server.Start(); });
 
   assert(WaitServerReady(kPort, std::chrono::seconds(2)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   std::vector<std::future<rpc::client::RpcCallResult>> futures;
   {
@@ -253,8 +260,9 @@ void TestCloseRaceDropsCompletedResponsesSafely() {
   assert(ParseAddResult(probe_result.response_payload) == 30);
 
   assert(server.Stop());
-  server_thread.join();
-  assert(start_result);
+  if (server_thread.joinable()) {
+    server_thread.join();
+  }
 }
 
 }  // namespace

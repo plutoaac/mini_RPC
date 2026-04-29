@@ -5,8 +5,6 @@
 #include <system_error>
 #include <utility>
 
-#include "rpc.pb.h"
-
 namespace rpc::common {
 
 // 框架内部统一错误码：服务端、客户端、业务异常都复用这一套。
@@ -62,45 +60,12 @@ class RpcErrorCategory final : public std::error_category {
 }
 
 // 框架错误码 -> protobuf 错误码（用于网络传输）。
-[[nodiscard]] inline rpc::ErrorCode ToProtoErrorCode(
-    const std::error_code& code) {
-  if (!code) {
-    return rpc::OK;
-  }
-  if (code.category() != GetRpcErrorCategory()) {
-    return rpc::INTERNAL_ERROR;
-  }
-  const auto rpc_code = static_cast<ErrorCode>(code.value());
-
-  switch (rpc_code) {
-    case ErrorCode::kOk:
-      return rpc::OK;
-    case ErrorCode::kMethodNotFound:
-      return rpc::METHOD_NOT_FOUND;
-    case ErrorCode::kParseError:
-      return rpc::PARSE_ERROR;
-    case ErrorCode::kInternalError:
-      return rpc::INTERNAL_ERROR;
-    default:
-      return rpc::INTERNAL_ERROR;
-  }
-}
+// 返回值类型为 int（底层等价于 rpc::ErrorCode），避免头文件依赖 rpc.pb.h。
+[[nodiscard]] int ToProtoErrorCode(const std::error_code& code);
 
 // protobuf 错误码 -> 框架错误码（用于客户端统一处理）。
-[[nodiscard]] inline std::error_code FromProtoErrorCode(rpc::ErrorCode code) {
-  switch (code) {
-    case rpc::OK:
-      return make_error_code(ErrorCode::kOk);
-    case rpc::METHOD_NOT_FOUND:
-      return make_error_code(ErrorCode::kMethodNotFound);
-    case rpc::PARSE_ERROR:
-      return make_error_code(ErrorCode::kParseError);
-    case rpc::INTERNAL_ERROR:
-      return make_error_code(ErrorCode::kInternalError);
-    default:
-      return make_error_code(ErrorCode::kInternalError);
-  }
-}
+// 参数类型为 int（底层等价于 rpc::ErrorCode），避免头文件依赖 rpc.pb.h。
+[[nodiscard]] std::error_code FromProtoErrorCode(int code);
 
 // 统一状态对象：替代 scattered 的 bool + error_msg 组合。
 struct Status {

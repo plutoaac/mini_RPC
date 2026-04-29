@@ -39,7 +39,6 @@
 #include <thread>
 #include <vector>
 
-#include "benchmark_stats.h"
 #include "client/rpc_client.h"
 #include "common/log.h"
 #include "server/rpc_server.h"
@@ -467,7 +466,9 @@ int main(int argc, char** argv) {
   rpc::client::RpcClient client(
       "127.0.0.1", options.port,
       {.send_timeout = std::chrono::milliseconds(5000),
-       .recv_timeout = std::chrono::milliseconds(5000)});
+       .recv_timeout = std::chrono::milliseconds(5000),
+       .heartbeat_interval = std::chrono::seconds(0),
+       .heartbeat_timeout = std::chrono::seconds(0)});
 
   // ---------- 选择窗口序列 ----------
   std::vector<int> depths;
