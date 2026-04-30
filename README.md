@@ -359,6 +359,7 @@ rpc_client_pool_test
 
 ```text
 build-debug: 22/22 tests passed
+build-release: 22/22 tests passed (2026-04-30)
 ```
 
 ## Benchmarks
@@ -384,15 +385,18 @@ LOG_LEVEL=off ./scripts/run_benchmarks.sh build-release
 
 ### 代表性结果 (Release -O3, 4-core Xeon Gold 6254, loopback, log=off)
 
-| Benchmark | 关键指标 |
-|-----------|---------|
-| Baseline sync RPC | p50 ≈ 70-100us, QPS ≈ 40k (1000 req, 并发 8) |
-| Pipeline depth=64 | QPS ≈ 51k, p99 ≈ 42ms (50k req, 单连接) |
-| Conn Pool 8×32 | QPS ≈ 71k, p99 ≈ 45ms |
-| ClientPool RoundRobin | 分发均匀 (33.3%/endpoint), QPS ≈ 68k |
-| ClientPool LeastInflight | fast:slow ≈ 95:5 分发偏快节点, QPS ≈ 24k |
-| ThreadPool E2E (20ms sleep) | inline → pool: QPS 翻倍, p95 从 221ms → 80ms |
-| ThreadPool microbench (4w×32p) | p50: 12ms → 120us (100x), QPS 1.8x |
+| Benchmark | 配置 | QPS | P50(us) | P95(us) | P99(us) |
+|-----------|------|-----|---------|---------|---------|
+| Baseline sync | 8 并发, 128B payload, 1k req | 30,933 | — | 291 | 1,126 |
+| Pipeline | depth=64, 64B, 50k req | 56,346 | — | 1,556 | 1,964 |
+| Conn Pool | 8 conns × depth=32, 64B, 100k req | 83,119 | — | 3,383 | 44,468 |
+| ClientPool RR | 8 并发, 50k req, 3 endpoints | 73,932 | 93 | 205 | 287 |
+| ClientPool LSI | 8 并发, 50k req, fast+slow | 24,219 | 132 | 277 | 4,306 |
+| ThreadPool E2E | 20ms handler, 1024 req, 16 并发 | inline: 99.3 → pool: **199.0 (2.0x)** | — | 221ms → **80ms** | 261ms → **80ms** |
+| ThreadPool micro | 4w × 32p, 50k empty tasks | OLD: 1,018k → NEW: **1,462k (1.4x)** | 16ms → **37us** | 18ms → **1,244us** | 18ms → **3,720us** |
+
+> ClientPool LeastInflight 快慢节点分布：fast 96.5%, slow 3.5%。  
+> E2E 和 microbench 为 Release build 实测；Pipeline p99 在不同 run 间波动较大，取决于 epoll 调度时序。
 
 ### 单独运行示例
 
@@ -404,7 +408,7 @@ LOG_LEVEL=off ./scripts/run_benchmarks.sh build-release
 ./build-release/rpc_thread_pool_benchmark 1024 16 20 benchmarks/results/tmp
 ```
 
-> **注意**: 以上为单机 loopback 数据，不等同网络场景。详细信息见 `benchmarks/results/run_*/summary.md`。
+> **注意**: 以上为单机 loopback 数据，不等同网络场景。详细分析见 `benchmarks/results/benchmark_analysis.md`，原始数据见 `benchmarks/results/run_20260430_112749/`。
 
 ## Reliability Scenarios Covered
 
