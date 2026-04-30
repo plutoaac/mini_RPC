@@ -450,10 +450,4 @@ LOG_LEVEL=off ./scripts/run_benchmarks.sh build-release
 - 完整流式 RPC
 - 跨平台网络抽象
 
-## Resume Keywords
 
-适合在简历中概括为：
-
-```text
-基于 C++20 / Linux epoll / Protobuf 实现轻量级 RPC 框架，支持同步、future 异步与 coroutine 调用；服务端采用 Acceptor + 多 WorkerLoop 架构，连接绑定 owner worker；实现 request_id 分发、连接池、负载均衡、心跳检测、超时收敛、业务线程池和 benchmark suite，并通过 22 个自动化测试覆盖并发与生命周期场景。
-```
