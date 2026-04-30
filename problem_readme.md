@@ -7,6 +7,12 @@
 ## 目录
 
 1. [Bug 猎手：定位与修复](#1-bug-猎手)
+    1. [TCP_NODELAY](#11-tcp_nodelay--270-倍-qps-的-socket-选项)
+    2. [Coroutine Double Free](#12-coroutine-double-free--协程生命周期竞态)
+    3. [Server Connection Hang](#13-server-connection-hang--阻塞-fd-遇上非阻塞事件循环)
+    4. [Lambda Stack-Use-After-Scope](#14-leastinflight-segfault--stack-use-after-scope)
+    5. [TOCTOU Div-by-Zero](#15-toctou-div-by-zero-in-leastinflightbalancer)
+    6. [ASAN 实战](#16-asan-实战--两个盲调很难的-bug)
 2. [竞态条件与并发陷阱](#2-竞态条件)
 3. [设计陷阱与 API 误用](#3-设计陷阱)
 4. [架构决策与权衡](#4-架构决策)
@@ -134,6 +140,44 @@ return tie_breaker_++ % tie_indices.size();  // div by zero
 **面试回答模板**：
 
 > "经典 TOCTOU——两次调用 `GetInflightCount()` 之间状态变了。修复不是加锁（会回到全局锁），而是兜底：tie_indices 为空就重新扫描一遍。对负载均衡来说，偶尔的多扫一遍比加锁的代价小得多。"
+
+---
+
+### 1.6 ASAN 实战 — 两个盲调很难的 bug
+
+`build-asan` 就是 `Debug + -fsanitize=address`。比普通 Debug 慢 2-3x，但能精确到行号定位 heap/stack 内存错误。调试这两个 bug 时 ASAN 是关键工具。
+
+**Bug A：stack-use-after-scope — lambda 引用捕获悬垂**
+
+```text
+==65360==ERROR: AddressSanitizer: stack-use-after-scope on address 0x... thread T9
+READ of size 4 at 0x7f... in operator() rpc_client_pool_benchmark.cpp:446
+...
+  'req_count' (line 443) <== Memory access at offset 336 is inside this variable
+```
+
+ASAN 直接标出了变量名（`req_count`）和定义行号（line 443）。不用 ASAN 的话，这个 bug 的表现是"偶尔 segfault，有时又能跑通"——典型的多线程栈内存踩踏，gdb 只能看到崩溃地址但不知道是哪个变量。
+
+**Bug B：FPE div-by-zero — 空容器除零**
+
+```text
+==66142==ERROR: AddressSanitizer: FPE
+  rpc::client::LeastInflightBalancer::Select() load_balancer.cpp:40
+```
+
+第 40 行是 `% tie_indices.size()`。ASAN 告诉你是 `FPE`（浮点异常 = 整数除零），而不是通用的 `SIGSEGV`。普通崩溃在 gdb 里看到的是信号号（SIGFPE），但不会告诉你除零发生在 `%` 运算——ASAN 装上了自己的信号处理器所以能区分出来。
+
+**为什么 ASAN 比 gdb 快**：
+
+| 场景 | gdb 需要 | ASAN 直接给 |
+|------|---------|------------|
+| use-after-scope | breakpoint + watch + 反复重现 | 变量名 + 定义行号 + 访问线程 |
+| div-by-zero | `bt` + 反汇编看寄存器确认除零位置 | 行号 + 表达式类型 |
+| heap-use-after-free | 很难重现，依赖 jemalloc 布局 | 精确到 malloc/free 调用栈 |
+
+**面试回答模板**：
+
+> "我专门建了一个 `build-asan` 配置（`-fsanitize=address`）。lambda use-after-scope 那个 bug，gdb 只能看到崩溃地址不知道是哪个变量，ASAN 直接说 'req_count line 443 inside this variable'。TOCTOU 除零那个，普通崩溃是 SIGFPE，ASAN 精确标出 `% tie_indices.size()` 是除零表达式。这两个 bug 如果没有 ASAN，靠 gdb 盲调可能要几小时。"
 
 ---
 
