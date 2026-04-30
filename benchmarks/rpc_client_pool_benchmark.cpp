@@ -71,6 +71,7 @@ struct BenchOptions {
 struct PoolBenchmarkResult {
   std::string scenario;
   int total_requests{0};
+  int concurrency{0};
   int success_count{0};
   int failed_count{0};
   int timeout_count{0};
@@ -177,6 +178,7 @@ PoolBenchmarkResult BuildResult(const std::string& scenario,
   PoolBenchmarkResult result;
   result.scenario = scenario;
   result.total_requests = options.total_requests;
+  result.concurrency = options.concurrency;
   result.success_count = success_count;
   result.failed_count = failed_count;
   result.timeout_count = timeout_count;
@@ -302,7 +304,7 @@ PoolBenchmarkResult RunRoundRobinScenario(const BenchOptions& options) {
   for (int i = 0; i < options.concurrency; ++i) {
     const int req_count = base + (i < rem ? 1 : 0);
     thread_latencies[i].reserve(static_cast<std::size_t>(req_count));
-    workers.emplace_back([&, i]() {
+    workers.emplace_back([&, i, req_count]() {
       for (int j = 0; j < req_count; ++j) {
         const auto t1 = std::chrono::steady_clock::now();
         auto result = pool.Call("BenchmarkService", "Echo", payload);
@@ -440,7 +442,7 @@ PoolBenchmarkResult RunLeastInflightScenario(const BenchOptions& options) {
   for (int i = 0; i < options.concurrency; ++i) {
     const int req_count = base + (i < rem ? 1 : 0);
     thread_latencies[i].reserve(static_cast<std::size_t>(req_count));
-    workers.emplace_back([&, i]() {
+    workers.emplace_back([&, i, req_count]() {
       for (int j = 0; j < req_count; ++j) {
         const auto t1 = std::chrono::steady_clock::now();
         auto future =
@@ -679,7 +681,46 @@ bool WritePoolResult(const PoolBenchmarkResult& r,
   }
   tf.close();
 
-  std::cout << "result_file=" << text_path << "\n";
+  std::cout << "result_text_file=" << text_path << "\n";
+
+  // 写入 CSV 摘要行
+  const std::string csv_path = output_dir + "/" + file_stem + ".csv";
+  std::ofstream csf(csv_path);
+  if (csf) {
+    csf << "scenario,concurrency,total_requests,payload_bytes,success_count,failed_count,qps,avg_us,p50_us,p95_us,p99_us\n";
+    csf << r.scenario << ","
+        << r.concurrency << ","
+        << r.total_requests << ","
+        << r.payload_bytes << ","
+        << r.success_count << ","
+        << r.failed_count << ","
+        << std::fixed << std::setprecision(1) << r.qps << ","
+        << r.avg_latency_us << ","
+        << r.p50_latency_us << ","
+        << r.p95_latency_us << ","
+        << r.p99_latency_us << "\n";
+    csf.close();
+    std::cout << "result_csv_file=" << csv_path << "\n";
+  }
+
+  // 写入 endpoint stats CSV
+  if (!r.endpoint_stats.empty()) {
+    const std::string eps_csv_path = output_dir + "/" + file_stem + "_endpoints.csv";
+    std::ofstream epsf(eps_csv_path);
+    if (epsf) {
+      epsf << "scenario,endpoint,select_count,success_count,fail_count,inflight,healthy\n";
+      for (const auto& ep : r.endpoint_stats) {
+        epsf << r.scenario << ","
+             << ep.endpoint << ","
+             << ep.select_count << ","
+             << ep.success_count << ","
+             << ep.fail_count << ","
+             << ep.inflight << ","
+             << (ep.healthy ? "true" : "false") << "\n";
+      }
+      epsf.close();
+    }
+  }
 
   // 同时写入 summary.md
   const std::string summary_path = output_dir + "/summary.md";

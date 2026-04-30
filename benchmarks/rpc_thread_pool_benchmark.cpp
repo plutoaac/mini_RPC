@@ -78,7 +78,10 @@ std::string BuildAddPayload(int a, int b) {
   req.set_b(b);
   std::string payload;
   const bool ok = req.SerializeToString(&payload);
-  assert(ok);
+  if (!ok) {
+    std::cerr << "BuildAddPayload: SerializeToString failed\n";
+    std::abort();
+  }
   return payload;
 }
 
@@ -93,7 +96,7 @@ rpc::benchmark::BenchmarkResult RunScenario(std::string name,
                                             int total_requests, int concurrency,
                                             int handler_sleep_ms) {
   rpc::server::ServiceRegistry registry;
-  assert(registry.Register(
+  if (!registry.Register(
       "SlowService", "Add", [handler_sleep_ms](std::string_view in) {
         calc::AddRequest req;
         if (!req.ParseFromArray(in.data(), static_cast<int>(in.size()))) {
@@ -108,10 +111,15 @@ rpc::benchmark::BenchmarkResult RunScenario(std::string name,
         resp.set_result(req.a() + req.b());
         std::string out;
         const bool ok = resp.SerializeToString(&out);
-        assert(ok);
+        if (!ok) {
+          throw rpc::server::RpcError(rpc::server::RpcStatusCode::kInternalError,
+                                      "failed to serialize response");
+        }
         return out;
-      }));
-
+      })) {
+    std::cerr << "failed to register SlowService.Add\n";
+    std::abort();
+  }
   rpc::server::RpcServer server(port, registry, worker_count,
                                 business_thread_count);
 
@@ -192,7 +200,10 @@ rpc::benchmark::BenchmarkResult RunScenario(std::string name,
     stats.Merge(std::move(local));
   }
 
-  assert(server.Stop());
+  if (!server.Stop()) {
+    std::cerr << "server.Stop() returned false for scenario " << name << "\n";
+    std::abort();
+  }
   server_thread.join();
   assert(start_result);
 

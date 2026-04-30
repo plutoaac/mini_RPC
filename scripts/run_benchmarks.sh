@@ -4,36 +4,26 @@
 # @brief 一键运行所有推荐 benchmark 并保存结果
 #
 # 用法：
-#   ./scripts/run_benchmarks.sh [build_dir]
+#   LOG_LEVEL=off ./scripts/run_benchmarks.sh build-release
 #
 # 默认 build_dir 为 build
-#
-# 推荐使用 Release 构建以获得准确性能数据：
-#   cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-#   cmake --build build-release -j
-#   ./scripts/run_benchmarks.sh build-release
-#
-# Benchmark 默认使用 --log=off 关闭日志，以避免异步日志系统影响性能测量。
-# 可使用 --log=info 做 A/B 对比，观察日志开销。
+# LOG_LEVEL 默认 off（避免日志影响 QPS 测量）
 #
 # 结果目录结构：
 #   benchmarks/results/run_YYYYMMDD_HHMMSS/
+#   ├── env.md               # 环境信息
+#   ├── commands.md           # 运行命令记录
 #   ├── baseline/
 #   ├── pipeline/
 #   ├── conn_pool/
 #   ├── client_pool/
 #   ├── thread_pool/
-#   └── summary.md
+#   └── summary.md           # 自动生成
 
 set -euo pipefail
 
-# 默认 build 目录
 BUILD_DIR="${1:-build}"
-
-# Benchmark 默认日志级别：off（避免日志影响 QPS 测量）
 LOG_LEVEL="${LOG_LEVEL:-off}"
-
-# 生成 timestamp 目录
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 RESULTS_BASE="benchmarks/results"
 RESULTS_DIR="$RESULTS_BASE/run_$TIMESTAMP"
@@ -42,33 +32,94 @@ echo "=========================================="
 echo "  mini_RPC Benchmark Suite"
 echo "=========================================="
 echo ""
-echo "IMPORTANT: For accurate QPS measurement, use Release build:"
-echo "  cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release"
-echo "  cmake --build build-release -j"
-echo "  ./scripts/run_benchmarks.sh build-release"
-echo ""
 echo "Build directory: $BUILD_DIR"
 echo "Log level: $LOG_LEVEL"
 echo "Results directory: $RESULTS_DIR"
 echo ""
 
-# 可执行文件检查
-check_executable() {
-    local bin="$1"
-    if [[ ! -x "$bin" ]]; then
-        echo "ERROR: $bin not found or not executable" >&2
-        echo "Please run: cmake --build $BUILD_DIR -j" >&2
-        return 1
-    fi
-    return 0
+# =============================================
+# 创建目录 + 保存环境信息
+# =============================================
+mkdir -p "$RESULTS_DIR"/{baseline,pipeline,conn_pool,client_pool,thread_pool}
+
+cat > "$RESULTS_DIR/env.md" << 'ENVEOF'
+# Benchmark Environment
+
+ENVEOF
+
+{
+  echo "## CPU"
+  echo '```'
+  lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|MHz|Socket' 2>/dev/null || true
+  echo '```'
+  echo ""
+  echo "## Memory"
+  echo '```'
+  free -h 2>/dev/null || true
+  echo '```'
+  echo ""
+  echo "## OS / Kernel"
+  echo '```'
+  uname -a 2>/dev/null || true
+  echo '```'
+  echo ""
+  echo "## Compiler"
+  echo '```'
+  g++ --version 2>/dev/null | head -1 || true
+  echo '```'
+  echo ""
+  echo "## Protobuf"
+  echo '```'
+  protoc --version 2>/dev/null || echo "protoc not found"
+  echo '```'
+  echo ""
+  echo "## CMake Build Type"
+  if [ -f "$BUILD_DIR/CMakeCache.txt" ]; then
+    echo '```'
+    grep -E 'CMAKE_BUILD_TYPE|CMAKE_CXX_FLAGS_RELEASE|CMAKE_CXX_STANDARD' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | grep -v ADVANCED || true
+    echo '```'
+  else
+    echo "(CMakeCache.txt not found)"
+  fi
+  echo ""
+  echo "## Benchmark Parameters"
+  echo "- LOG_LEVEL: $LOG_LEVEL"
+  echo "- Timestamp: $TIMESTAMP"
+} >> "$RESULTS_DIR/env.md" 2>/dev/null
+
+# 保存命令记录
+CMDS_FILE="$RESULTS_DIR/commands.md"
+cat > "$CMDS_FILE" << EOF
+# Benchmark Commands
+
+Run at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+Build dir: $BUILD_DIR
+Log level: $LOG_LEVEL
+
+EOF
+
+record_cmd() {
+  local section="$1"
+  local cmd="$2"
+  echo "## $section" >> "$CMDS_FILE"
+  echo '```bash' >> "$CMDS_FILE"
+  echo "$cmd" >> "$CMDS_FILE"
+  echo '```' >> "$CMDS_FILE"
+  echo "" >> "$CMDS_FILE"
 }
 
-# 创建结果子目录
-mkdir -p "$RESULTS_DIR/baseline"
-mkdir -p "$RESULTS_DIR/pipeline"
-mkdir -p "$RESULTS_DIR/conn_pool"
-mkdir -p "$RESULTS_DIR/client_pool"
-mkdir -p "$RESULTS_DIR/thread_pool"
+# =============================================
+# 可执行文件检查
+# =============================================
+check_executable() {
+  local bin="$1"
+  if [[ ! -x "$bin" ]]; then
+    echo "ERROR: $bin not found or not executable" >&2
+    echo "Please run: cmake --build $BUILD_DIR -j" >&2
+    return 1
+  fi
+  return 0
+}
 
 echo "Results will be saved to: $RESULTS_DIR"
 echo ""
@@ -82,10 +133,11 @@ echo "=========================================="
 BENCH_BIN="$BUILD_DIR/rpc_benchmark"
 check_executable "$BENCH_BIN"
 "$BENCH_BIN" --mode=sync --requests=1000 --concurrency=8 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/baseline"
+record_cmd "Baseline Benchmark" "$BENCH_BIN --mode=sync --requests=1000 --concurrency=8 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/baseline"
 echo ""
 
 # =============================================
-# B. Pipeline Benchmark (多 depth 扫描)
+# B. Pipeline Benchmark
 # =============================================
 echo "=========================================="
 echo "B. Pipeline Benchmark (depth sweep)"
@@ -93,51 +145,47 @@ echo "=========================================="
 PIPELINE_BIN="$BUILD_DIR/rpc_benchmark_pipeline"
 check_executable "$PIPELINE_BIN"
 
-echo "--- depth=1 (serial baseline) ---"
-"$PIPELINE_BIN" --requests=20000 --depth=1 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/pipeline"
-
-echo ""
-echo "--- depth=8 ---"
-"$PIPELINE_BIN" --requests=50000 --depth=8 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/pipeline"
-
-echo ""
-echo "--- depth=32 ---"
-"$PIPELINE_BIN" --requests=50000 --depth=32 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/pipeline"
-
-echo ""
-echo "--- depth=64 (higher concurrency) ---"
-"$PIPELINE_BIN" --requests=50000 --depth=64 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/pipeline"
-
-echo ""
+for depth in 1 8 32 64; do
+  reqs=20000
+  [ "$depth" -gt 1 ] && reqs=50000
+  echo "--- depth=$depth, requests=$reqs ---"
+  "$PIPELINE_BIN" --requests="$reqs" --depth="$depth" --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/pipeline"
+  record_cmd "Pipeline depth=$depth" "$PIPELINE_BIN --requests=$reqs --depth=$depth --payload_bytes=64 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/pipeline"
+  echo ""
+done
 
 # =============================================
-# C. Connection Pool Benchmark (多连接 × 多 depth)
+# C. Connection Pool Benchmark
 # =============================================
 echo "=========================================="
-echo "C. Connection Pool Benchmark (conns × depth)"
+echo "C. Connection Pool Benchmark (conns x depth)"
 echo "=========================================="
 CONN_POOL_BIN="$BUILD_DIR/rpc_benchmark_conn_pool"
 check_executable "$CONN_POOL_BIN"
 
 echo "--- conns=1, depth=8 (baseline) ---"
 "$CONN_POOL_BIN" --requests=50000 --conns=1 --depth=8 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/conn_pool"
+record_cmd "ConnPool conns=1 depth=8" "$CONN_POOL_BIN --requests=50000 --conns=1 --depth=8 --payload_bytes=64 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/conn_pool"
 
 echo ""
 echo "--- conns=4, depth=8 ---"
 "$CONN_POOL_BIN" --requests=100000 --conns=4 --depth=8 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/conn_pool"
+record_cmd "ConnPool conns=4 depth=8" "$CONN_POOL_BIN --requests=100000 --conns=4 --depth=8 --payload_bytes=64 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/conn_pool"
 
 echo ""
 echo "--- conns=4, depth=32 ---"
 "$CONN_POOL_BIN" --requests=100000 --conns=4 --depth=32 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/conn_pool"
+record_cmd "ConnPool conns=4 depth=32" "$CONN_POOL_BIN --requests=100000 --conns=4 --depth=32 --payload_bytes=64 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/conn_pool"
 
 echo ""
-echo "--- conns=8, depth=32 (recommended test point) ---"
+echo "--- conns=8, depth=32 ---"
 "$CONN_POOL_BIN" --requests=100000 --conns=8 --depth=32 --payload_bytes=64 --log="$LOG_LEVEL" --output_dir="$RESULTS_DIR/conn_pool"
+record_cmd "ConnPool conns=8 depth=32" "$CONN_POOL_BIN --requests=100000 --conns=8 --depth=32 --payload_bytes=64 --log=$LOG_LEVEL --output_dir=$RESULTS_DIR/conn_pool"
 
 echo ""
 
 # =============================================
-# D. Thread Pool Benchmark (inline vs pool)
+# D. Thread Pool Benchmark (e2e RPC)
 # =============================================
 echo "=========================================="
 echo "D. Thread Pool Benchmark (inline vs pool)"
@@ -145,15 +193,14 @@ echo "=========================================="
 THREAD_POOL_BIN="$BUILD_DIR/rpc_thread_pool_benchmark"
 check_executable "$THREAD_POOL_BIN"
 
-echo "Running with handler_sleep_ms=20 (moderate slow handler)"
-# Note: thread pool benchmark has its own port setup, log param via env
-# 请求数 1024，并发 16，sleep 20ms
+echo "Running with handler_sleep_ms=20, requests=1024, concurrency=16"
 LOG_LEVEL="$LOG_LEVEL" "$THREAD_POOL_BIN" 1024 16 20 "$RESULTS_DIR/thread_pool"
+record_cmd "ThreadPool e2e" "$THREAD_POOL_BIN 1024 16 20 $RESULTS_DIR/thread_pool"
 
 echo ""
 
 # =============================================
-# E. RpcClientPool Benchmark (测试不同分发策略)
+# E. RpcClientPool Benchmark
 # =============================================
 echo "=========================================="
 echo "E. RpcClientPool Benchmark (shared pool)"
@@ -161,16 +208,43 @@ echo "=========================================="
 CLIENT_POOL_BIN="$BUILD_DIR/rpc_client_pool_benchmark"
 check_executable "$CLIENT_POOL_BIN"
 
-echo "--- scenario=round_robin, requests=50000 ---"
+echo "--- scenario=round_robin, requests=50000, concurrency=8 ---"
 "$CLIENT_POOL_BIN" --scenario=round_robin --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir="$RESULTS_DIR/client_pool"
+record_cmd "ClientPool round_robin 50k" "$CLIENT_POOL_BIN --scenario=round_robin --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir=$RESULTS_DIR/client_pool"
 
 echo ""
-echo "--- scenario=least_inflight, requests=50000 ---"
-"$CLIENT_POOL_BIN" --scenario=least_inflight --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir="$RESULTS_DIR/client_pool"
+echo "--- scenario=least_inflight, requests=50000, concurrency=8 ---"
+"$CLIENT_POOL_BIN" --scenario=least_inflight --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir="$RESULTS_DIR/client_pool" || echo "WARNING: least_inflight failed"
+record_cmd "ClientPool least_inflight 50k c=8" "$CLIENT_POOL_BIN --scenario=least_inflight --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir=$RESULTS_DIR/client_pool"
 
 echo ""
-echo "--- scenario=round_robin, requests=100000 ---"
+echo "--- scenario=round_robin, requests=100000, concurrency=16 ---"
 "$CLIENT_POOL_BIN" --scenario=round_robin --requests=100000 --payload_bytes=64 --concurrency=16 --output_dir="$RESULTS_DIR/client_pool"
+record_cmd "ClientPool round_robin 100k" "$CLIENT_POOL_BIN --scenario=round_robin --requests=100000 --payload_bytes=64 --concurrency=16 --output_dir=$RESULTS_DIR/client_pool"
+
+echo ""
+
+# =============================================
+# F. ThreadPool Microbenchmark (before/after)
+# =============================================
+echo "=========================================="
+echo "F. ThreadPool Microbenchmark (before/after)"
+echo "=========================================="
+TP_MICRO_BIN="$BUILD_DIR/thread_pool_benchmark"
+if [ -x "$TP_MICRO_BIN" ]; then
+  echo "--- tasks=20000, workers=4, producers=4 ---"
+  "$TP_MICRO_BIN" 20000 4 4 > "$RESULTS_DIR/thread_pool/microbench_4w4p.txt" 2>&1
+  cat "$RESULTS_DIR/thread_pool/microbench_4w4p.txt"
+  record_cmd "ThreadPool micro 4w4p" "$TP_MICRO_BIN 20000 4 4"
+
+  echo ""
+  echo "--- tasks=50000, workers=4, producers=8 ---"
+  "$TP_MICRO_BIN" 50000 4 8 > "$RESULTS_DIR/thread_pool/microbench_4w8p.txt" 2>&1
+  cat "$RESULTS_DIR/thread_pool/microbench_4w8p.txt"
+  record_cmd "ThreadPool micro 4w8p" "$TP_MICRO_BIN 50000 4 8"
+else
+  echo "WARNING: thread_pool_benchmark not found, skipping microbenchmark"
+fi
 
 echo ""
 
@@ -183,6 +257,18 @@ echo "=========================================="
 python3 scripts/summarize_benchmarks.py "$RESULTS_DIR"
 
 # =============================================
+# 写 latest_summary.md 链接
+# =============================================
+LATEST="$RESULTS_BASE/latest_summary.md"
+cat > "$LATEST" << EOF
+# Latest Benchmark Summary
+
+Latest run: [$TIMESTAMP](run_$TIMESTAMP/summary.md)
+
+Full results: [run_$TIMESTAMP/](run_$TIMESTAMP/)
+EOF
+
+# =============================================
 # 汇总
 # =============================================
 echo ""
@@ -191,23 +277,11 @@ echo "Benchmark Complete!"
 echo "=========================================="
 echo ""
 echo "Results saved to: $RESULTS_DIR"
+echo "  Summary: $RESULTS_DIR/summary.md"
+echo "  Env: $RESULTS_DIR/env.md"
+echo "  Commands: $RESULTS_DIR/commands.md"
 echo ""
 echo "Next steps:"
-echo "  1. Check raw results:"
-echo "     ls $RESULTS_DIR/baseline/"
-echo "     ls $RESULTS_DIR/pipeline/"
-echo "     ls $RESULTS_DIR/conn_pool/"
-echo "     ls $RESULTS_DIR/client_pool/"
-echo "     ls $RESULTS_DIR/thread_pool/"
-echo "  2. View summary: cat $RESULTS_DIR/summary.md"
-echo ""
-echo "Interpretation:"
-echo "  - QPS = success_count / elapsed_seconds"
-echo "  - Only successful requests are counted"
-echo "  - If failed_count > 0, interpret results carefully"
-echo "  - Higher depth increases throughput but may increase tail latency"
-echo "  - More connections can break single-connection bottleneck"
-echo ""
-echo "Note: If there are any failures/timeouts, check WARNING messages above."
-echo "For accurate QPS, always use Release build and --log=off."
+echo "  cat $RESULTS_DIR/summary.md"
+echo "  cat $RESULTS_DIR/env.md"
 echo ""

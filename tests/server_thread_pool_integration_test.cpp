@@ -131,10 +131,11 @@ void TestBasicCallRegressionWithBusinessThreadPool() {
   assert(stats.business_thread_pool->submitted_tasks >= 3U);
   assert(ContainsMethodStats(stats, "CalcService.Add", 3U));
 
-  assert(server.Stop());
+  server.Stop();
   if (server_thread.joinable()) {
     server_thread.join();
   }
+  assert(*start_result);
 }
 
 void TestSlowHandlerConcurrencyAndStats() {
@@ -191,12 +192,13 @@ void TestSlowHandlerConcurrencyAndStats() {
   assert(stats.business_thread_pool->completed_tasks >=
          static_cast<std::size_t>(kRequests));
   assert(ContainsMethodStats(stats, "SlowService.Add",
-                             static_cast<std::size_t>(kRequests)));
+                              static_cast<std::size_t>(kRequests)));
 
-  assert(server.Stop());
+  server.Stop();
   if (server_thread.joinable()) {
     server_thread.join();
   }
+  assert(start_result);
 }
 
 void TestCloseRaceDropsCompletedResponsesSafely() {
@@ -259,10 +261,11 @@ void TestCloseRaceDropsCompletedResponsesSafely() {
   assert(probe_result.ok());
   assert(ParseAddResult(probe_result.response_payload) == 30);
 
-  assert(server.Stop());
+  server.Stop();
   if (server_thread.joinable()) {
     server_thread.join();
   }
+  assert(start_result);
 }
 
 }  // namespace

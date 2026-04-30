@@ -248,8 +248,58 @@ std::future<RpcCallResult> RpcClientPool::CallAsync(
     return future;
   }
 
-  // select_count 已在 SelectChannel() 中统一计数，此处不再重复
-  return ch->client->CallAsync(service_name, method_name, request_payload);
+  std::string svc(service_name), method(method_name), payload(request_payload);
+  auto inner_future = ch->client->CallAsync(svc, method, payload);
+
+  // 保持真异步语义：后台线程等待 inner future 完成后记录统计，再设置 outer promise
+  // Lambda 自包含（不捕获 this），避免 pool 析构后 use-after-free。
+  // Channel* 在 pool 生命周期内有效（benchmark 保证，生产需 pool 覆盖 future）。
+  auto promise = std::make_shared<std::promise<RpcCallResult>>();
+  auto outer_future = promise->get_future();
+  const auto max_failures = options_.max_consecutive_failures;
+
+  std::thread([ch, inner = std::move(inner_future), promise, max_failures]() mutable {
+    try {
+      auto result = inner.get();
+
+      // === RecordCallResult ===
+      if (result.ok()) {
+        ch->success_count.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        ch->fail_count.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      // === RecordReachability ===
+      bool is_connection_err = false;
+      if (!result.ok()) {
+        const std::string& msg = result.status.message;
+        is_connection_err =
+            msg.find("connect failed") != std::string::npos ||
+            msg.find("send request failed") != std::string::npos ||
+            msg.find("connection closed") != std::string::npos ||
+            msg.find("connection inactive") != std::string::npos ||
+            msg.find("dispatcher stopped") != std::string::npos ||
+            msg.find("call timeout") != std::string::npos;
+      }
+
+      if (!is_connection_err) {
+        ch->consecutive_failures.store(0, std::memory_order_release);
+        ch->healthy.store(true, std::memory_order_release);
+      } else {
+        const std::size_t failures =
+            ch->consecutive_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (failures >= max_failures) {
+          ch->healthy.store(false, std::memory_order_release);
+        }
+      }
+
+      promise->set_value(std::move(result));
+    } catch (...) {
+      promise->set_exception(std::current_exception());
+    }
+  }).detach();
+
+  return outer_future;
 }
 
 // ============================================================================
