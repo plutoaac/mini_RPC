@@ -1,896 +1,459 @@
-# 可扩展 C++ RPC 框架（最小可运行版本）
+# C++20 Linux RPC Framework
 
-本项目实现了一个基于 **C++20 + Protobuf + Linux TCP Socket** 的最小可运行 RPC 框架。
+一个基于 **C++20、Protobuf、Linux TCP Socket 与 epoll** 实现的轻量级 RPC 框架项目，重点实践网络 I/O、多线程事件驱动、异步结果分发、协程调用、连接池与性能评估。
 
-当前版本目标是“闭环可运行 + 分层清晰 + 便于演进”，后续可以平滑升级到：
-- C++20 coroutine 版本
-- io_uring 异步 IO 版本
+项目不是简单的阻塞式 demo，而是围绕真实 C++ 后端常见问题逐步展开：连接生命周期、线程边界、请求乱序返回、超时收敛、关闭竞态、业务线程池回投、客户端负载均衡与 benchmark。
 
-本阶段已从纯阻塞式连接处理，演进到轻量 event loop / reactor 雏形。
+## Highlights
 
-服务端当前定位：
-- 已从“accept 一个连接后阻塞处理到断开”演进为“Acceptor + WorkerLoop + Connection”分层
-- `RpcServer` 现在主要承担 Acceptor（listen/accept/分发）职责
-- `WorkerLoop` 负责连接所属 epoll、连接 map、连接协程主路径驱动
-- `Connection` 负责连接级协议解析、读写缓冲、awaiter、状态机与收敛
-- `Connection` 明确归属单一 `WorkerLoop`，并约束只在 owner worker 线程访问
-- 已进一步演进为“连接级 coroutine 主路径”：`HandleConnectionCo` 驱动读请求/执行业务/写响应
-- epoll 仍是唯一 I/O readiness 来源，`NotifyReadable/NotifyWritable` 负责恢复连接协程
-- 当前服务端已升级为多 WorkerLoop / one-loop-per-thread（最小可用版）
-- RpcServer 通过 round-robin 分发新连接，worker 通过 eventfd + 队列在所属线程接管连接
-- 新增最小业务线程池：handler 执行与连接 I/O 主路径解耦
-- 业务线程只产出结果，不直接访问 Connection；结果通过 worker 的回投队列回到 owner worker
-- RpcServer 已具备最小生命周期控制：Start/Stop 与 worker 收敛回收
-- 当前仍是轻量版本：不包含多 reactor / io_uring / 外部依赖
-- 这一步为后续服务端 coroutine 化与更强事件驱动打基础
+- 自定义长度前缀协议：`[4 bytes length][protobuf message]`
+- 通用 RPC 模型：`RpcRequest / RpcResponse` 承载任意业务 payload
+- 服务端采用 `RpcServer + WorkerLoop + Connection` 分层
+- 多 worker 架构：Acceptor 负责接入，WorkerLoop 采用 one-loop-per-thread 驱动连接
+- Connection 绑定 owner worker，避免连接状态跨线程共享
+- 支持同步调用、`std::future` 异步调用与 C++20 coroutine 调用
+- `PendingCalls` 基于 `request_id` 分发响应，支持多 in-flight 和乱序响应匹配
+- 客户端连接池 `RpcClientPool`，支持 RoundRobin 与 LeastInflight
+- 支持心跳、超时、连接关闭收敛、失败节点剔除与同步调用重试
+- 服务端可配置业务线程池，handler 执行与连接 I/O 线程解耦
+- 线程池基于每 worker 一个 MPSC ring queue，降低提交路径锁竞争
+- 提供 22 个自动化测试，覆盖协议、客户端、协程、服务端连接、线程池、心跳与连接池
+- 提供 benchmark suite，覆盖 baseline、pipeline、多连接、连接池、线程池与异步日志
 
-当前版本已将 coroutine API 从“future bridge”升级为“direct waiter”模式：
-- `PendingCalls` 支持 coroutine waiter（协程句柄 + deadline）
-- dispatcher 收到响应后按 `request_id` 直接恢复对应协程
+## Architecture
 
-在不推翻现有 async/event-loop 架构的前提下，`CallCo` 已不再依赖 `co_await CallAsync(...)`。
+### High-Level View
 
-## 1. 项目介绍
+```text
+                         ┌─────────────────────────────┐
+                         │          RpcClient          │
+                         │ Call / CallAsync / CallCo   │
+                         └──────────────┬──────────────┘
+                                        │
+                         ┌──────────────▼──────────────┐
+                         │        PendingCalls         │
+                         │ request_id -> waiter/result │
+                         └──────────────┬──────────────┘
+                                        │ TCP
+                                        ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                             RpcServer                              │
+│                                                                    │
+│  ┌──────────────┐      round-robin       ┌──────────────────────┐  │
+│  │   Acceptor   │ ─────────────────────▶ │      WorkerLoop       │  │
+│  │ listen/accept│                        │ epoll + connections   │  │
+│  └──────────────┘                        └──────────┬───────────┘  │
+│                                                     │              │
+│                                          ┌──────────▼───────────┐  │
+│                                          │      Connection       │  │
+│                                          │ read/write/state/co   │  │
+│                                          └──────────┬───────────┘  │
+│                                                     │              │
+│                                          ┌──────────▼───────────┐  │
+│                                          │   ServiceRegistry     │  │
+│                                          │ Service.Method -> fn  │  │
+│                                          └──────────┬───────────┘  │
+│                                                     │              │
+│                          optional business pool     ▼              │
+│                                          ┌──────────────────────┐  │
+│                                          │      ThreadPool       │  │
+│                                          │ MPSC queues + workers │  │
+│                                          └──────────────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+```
 
-框架能力（当前版本）：
-- 通用 RPC 请求/响应消息（`RpcRequest` / `RpcResponse`）
-- 自定义协议：`[4字节长度][protobuf数据]`
-- 服务端 Acceptor + 多 WorkerLoop（one-loop-per-thread）
-- 服务端最小业务线程池（可配置开关：0 表示 inline 执行）
-- owner-worker 回投模型（业务结果回投到连接归属 worker 再入写缓冲）
-- 服务端方法注册与分发（`service_name + method_name -> handler`）
-- 客户端通用调用接口
-- 客户端异步调用接口（`CallAsync`，返回 `std::future<RpcCallResult>`）
-- 客户端协程调用接口（`CallCo`，返回 `Task<RpcCallResult>`）
-- 基于 `std::error_code` 的统一错误体系
-- 基于 RAII 的 socket fd 生命周期管理（`UniqueFd`）
-- 基于 `std::source_location` 的轻量结构化日志
-- 客户端基础超时能力（`SO_SNDTIMEO` / `SO_RCVTIMEO`）
-- 客户端读写分工模型（调用线程发送 + event loop 驱动可读事件）
-- 客户端连接池（`RpcClientPool`）与基础负载均衡（RoundRobin / LeastInflight）
-- 客户端最小健康检查与故障转移（同步 Call 自动重试）
-- 自动化测试入口（协议层、注册中心、端到端）
-- Benchmark 入口（单连接延迟与吞吐）
-- 慢 handler 场景对比 benchmark（inline 执行 vs thread pool 执行）
-- PendingCalls（`request_id -> result slot`）与连接关闭竞态保护
+### Detailed View
 
-## 2. 架构说明
+```mermaid
+flowchart LR
+  subgraph ClientSide["Client Side"]
+    App["User Code<br/>Call / CallAsync / CallCo"]
+    Pool["RpcClientPool<br/>RoundRobin / LeastInflight<br/>health / retry / stats"]
+    Client["RpcClient<br/>persistent TCP connection<br/>write_mu + dispatcher thread"]
+    Pending["PendingCalls<br/>request_id -> Slot<br/>future waiter / coroutine waiter"]
+    ClientLoop["EventLoop<br/>epoll + eventfd wakeup"]
+    CodecC["Codec<br/>4-byte length + protobuf"]
 
-分层如下：
-- 协议层（`src/protocol`）：负责网络帧编解码，不关心业务类型
-- 序列化层（`proto`）：由 protobuf 定义通用 RPC 消息和业务消息
-- 公共基础层（`src/common`）：错误体系、fd RAII、日志设施
-- 框架层（`src/server`、`src/client`）：负责注册、分发、调用、错误处理
-- 业务层（`src/demo`）：`CalcService.Add` 示例
+    App --> Pool
+    App --> Client
+    Pool --> Client
+    Client --> Pending
+    Client --> ClientLoop
+    Client --> CodecC
+    ClientLoop --> Pending
+  end
 
-框架层与业务层解耦：
-- 框架层只传递 `bytes payload`
-- 业务 protobuf 的解析与序列化在业务 handler 内完成
+  subgraph Wire["TCP Transport"]
+    Frame["RpcRequest / RpcResponse<br/>request_id + service + method + payload"]
+  end
 
-## 3. 模块说明
+  subgraph ServerSide["Server Side"]
+    Server["RpcServer<br/>lifecycle / stats"]
+    Acceptor["Acceptor<br/>listen / epoll_wait / accept4"]
+    Dispatch["Round-robin dispatch<br/>UniqueFd + peer desc"]
 
-- `proto/rpc.proto`
-  - `RpcRequest`: `request_id`、`service_name`、`method_name`、`payload`
-  - `RpcResponse`: `request_id`、`error_code`、`error_msg`、`payload`
-  - `ErrorCode`: `OK`、`METHOD_NOT_FOUND`、`PARSE_ERROR`、`INTERNAL_ERROR`
+    subgraph Workers["Worker Threads"]
+      W0["WorkerLoop 0<br/>epoll fd + eventfd<br/>connection map"]
+      W1["WorkerLoop 1<br/>epoll fd + eventfd<br/>connection map"]
+      WN["WorkerLoop N<br/>epoll fd + eventfd<br/>connection map"]
+    end
 
-- `proto/calc.proto`
-  - `AddRequest { int32 a, int32 b }`
-  - `AddResponse { int32 result }`
+    Conn["Connection<br/>owner worker only<br/>read_buffer / write_buffer<br/>state machine / coroutine awaiters"]
+    Registry["ServiceRegistry<br/>Service.Method -> Handler"]
+    BizPool["ThreadPool optional<br/>per-worker MPSC queue<br/>batch pop / Stop / Join"]
+    Callback["Completed response queue<br/>business result returns to owner worker"]
+    CodecS["Codec<br/>frame decode / frame encode"]
 
-- `src/protocol/codec.*`
-  - 长度前缀协议编解码
-  - 阻塞式读写（完整读 N 字节 / 完整写 N 字节）
+    Server --> Acceptor
+    Acceptor --> Dispatch
+    Dispatch --> W0
+    Dispatch --> W1
+    Dispatch --> WN
+    W0 --> Conn
+    W1 --> Conn
+    WN --> Conn
+    Conn --> CodecS
+    Conn --> Registry
+    Registry --> BizPool
+    BizPool --> Callback
+    Callback --> Conn
+  end
 
-- `src/server/service_registry.*`
-  - 通用注册表
-  - handler 接口：输入请求 `bytes`，输出响应 `bytes`
-  - `Find()` 返回引用包装，避免复制 `std::function`
+  CodecC <--> Frame
+  Frame <--> CodecS
+  Pending <-->|response complete / timeout / close| ClientLoop
+```
 
-- `src/server/rpc_server.*`
-  - Acceptor 角色：listen socket 初始化、accept 新连接
-  - 按 round-robin 将新连接分发给多个 WorkerLoop
-  - 只负责接入和分发，不直接驱动连接协程
-  - 管理最小业务线程池生命周期（Start/Stop/Join）
-  - `business_thread_count=0` 时可切回 inline handler 执行（用于对比 benchmark）
-  - 持有 listen fd / accept epoll / workers 成员，统一管理生命周期
-  - 提供最小 `Stop()`：停止接入、通知 worker 停止、等待 worker join
-  - 提供运行时轻量统计快照（worker 连接数、in-flight、线程池统计）
+一次请求的主路径：
 
-- `src/server/worker_loop.*`
-  - 每个 worker 运行在独立线程（one-loop-per-thread）
-  - 持有 worker 专属 epoll fd、wake fd（eventfd）与 connection map
-  - 通过线程安全 pending 队列接收 acceptor 投递的新连接
-  - 在 worker 线程中注册/移除 client fd（保证线程亲和）
-  - 驱动连接可读/可写事件与连接协程主路径
-  - 可选把业务执行提交到线程池，并通过 completed-response 队列回投 owner worker
-  - worker 内统一将回投响应入连接写缓冲，不允许业务线程直接触碰连接对象
-  - 执行连接 timeout tick 与关闭收敛
-  - 停止路径分阶段：stop requested -> 不再接收新连接 -> drain pending -> 收敛现有连接
-  - 明确线程亲和：worker loop 只允许 owner 线程调用
-  - 提供最小启动/停止能力，便于测试和后续扩展
+1. 调用方通过 `RpcClient` 或 `RpcClientPool` 发起 `Call / CallAsync / CallCo`。
+2. 客户端生成 `request_id`，在 `PendingCalls` 中注册 future waiter 或 coroutine waiter。
+3. 请求被编码为长度前缀 frame，通过长连接写入 TCP。
+4. 服务端 `Acceptor` 接收连接，并按 round-robin 投递给某个 `WorkerLoop`。
+5. `WorkerLoop` 在 owner 线程中驱动 `Connection`，完成读缓冲、拆帧、反序列化和状态推进。
+6. `Connection` 根据 `service_name + method_name` 查找 `ServiceRegistry`。
+7. handler 可 inline 执行，也可提交到业务 `ThreadPool`。
+8. 业务线程完成后不直接触碰连接，而是把响应回投到 owner worker。
+9. owner worker 将响应写入 `Connection::write_buffer`，等待可写事件 flush。
+10. 客户端 dispatcher 线程收到响应后按 `request_id` 完成对应 waiter。
 
-- `src/server/connection.*`
-  - 连接级状态对象：`fd + read_buffer + write_buffer`
-  - 适配非阻塞 socket，处理 `EINTR` / `EAGAIN` / `EWOULDBLOCK`
-  - 从 socket 读入字节流并在 `read_buffer` 上做长度前缀拆帧
-  - 支持半包保留与多包批量解析（一次读取可处理多条请求）
-  - 在 inline 模式下可直接执行 handler；在线程池模式下只做解帧并把请求投递给 worker dispatcher
-  - 将响应帧写入 `write_buffer` 并在可写事件中 flush 到 socket
-  - 提供 owner-worker 入响应接口（EnqueueResponse），保证线程边界清晰
-  - 新增协程接口：`ReadRequestCo/WriteResponseCo`
-  - 新增协程等待点：`WaitReadableCo/WaitWritableCo`
-  - 新增 epoll 通知恢复入口：`NotifyReadable/NotifyWritable`
-  - 新增连接状态机：`Open/Reading/Writing/Closing/Closed/Error`
-  - 新增连接级 deadline：读超时、写超时可触发协程收敛退出
-  - 新增轻量背压保护：`write_buffer` 超阈值时返回错误并进入收敛路径
-  - 明确连接归属：连接绑定 owner worker，非 owner 线程访问属于误用
-  - 连接主协程启动时序更清晰：连接先进入 worker map，再启动协程主路径
+## Core Design
 
-## 服务端演进说明（当前阶段）
+### Protocol
 
-当前版本是最小可用多线程协程服务端（one-loop-per-thread），并已补上“连接 I/O 线程 + 业务执行线程”的最小分工，但仍不是完整生产级框架。
+传输层使用 4 字节大端长度头解决 TCP 粘包/半包问题，消息体使用 Protobuf 序列化。
 
-本次抽象的价值：
-- 固定职责边界：`RpcServer` 只做接入与分发，`WorkerLoop` 只做连接驱动
-- 固定连接归属：一个连接只归属一个 worker，避免跨线程共享连接状态
-- 在最小改动下落地“业务线程池 + owner-worker 回投”模型，继续复用现有 coroutine 主路径
-- 增强工程可控性：具备可测试的 Start/Stop 生命周期与清晰收敛语义
+```proto
+message RpcRequest {
+  string request_id = 1;
+  string service_name = 2;
+  string method_name = 3;
+  bytes payload = 4;
+}
 
-这次已引入的是“最小线程池”，不是复杂任务系统：
-- 不做 work-stealing / priority queue / future-heavy 框架
-- 不引入外部系统，不改 protobuf 主协议
-- 不允许业务线程直接访问 `Connection` 或跨线程 `epoll_ctl`
+message RpcResponse {
+  string request_id = 1;
+  ErrorCode error_code = 2;
+  string error_msg = 3;
+  bytes payload = 4;
+}
+```
 
-后续如果继续演进，可沿这些方向推进：
-1. 从 round-robin 演进到更强分发策略（负载、连接数、CPU 亲和）
-2. 增加更细粒度取消与调度语义（per-request cancellation）
-3. 继续完善 worker 停止与优雅收敛能力
-4. 评估 io_uring 作为下一代 I/O readiness/提交模型
+框架层只处理通用 RPC envelope，业务层自行解析 `payload`。当前 demo 包含 `CalcService.Add`，并预留了 `user.proto` 作为更复杂业务消息示例。
 
-- `src/client/rpc_client.*`
-  - 连接服务端
-  - 构造并发送 `RpcRequest`
-  - 独立 dispatcher 线程运行 event loop，监听 socket 可读事件
-  - 非阻塞读取并解析长度前缀响应帧
-  - 按 `request_id` 精确完成对应 in-flight 请求（含 async future）
-  - 提供 `CallAsync`（future-like 最小版本）
-  - 提供 `CallCo`（coroutine direct waiter，非 future bridge）
-  - 同步 `Call` 基于 `CallAsync().get()` 封装
-  - 通过 `Status(std::error_code + message)` 返回统一错误
-  - 通过 `PendingCalls` 进行请求与响应关联（支持多 in-flight）
+### Server
 
-- `src/client/event_loop.*`
-  - 轻量 epoll event loop（单线程、单连接 fd）
-  - 负责可读事件等待、超时 tick 与 wakeup
-  - 作为后续 coroutine 客户端调度的基础骨架
+服务端由三层组成：
 
-- `src/client/pending_calls.*`
-  - 维护 `request_id -> result slot` 的线程安全表
-  - 支持 `Add / BindAsync / BindCoroutine / Complete / FailTimedOut / FailAll`
-  - 同时管理 future waiter 与 coroutine waiter
-  - dispatcher 线程可直接完成 async promise，不需要每请求 watcher 线程
-  - dispatcher 线程可直接恢复 coroutine waiter（按 request_id）
-  - `FailAll` 仅标记未完成槽位，避免覆盖已完成结果（修复关闭连接竞态）
+- `RpcServer`：监听端口、accept 新连接、按 round-robin 分发给 worker
+- `WorkerLoop`：每个 worker 独立线程运行 epoll，接管连接和事件调度
+- `Connection`：维护单连接状态、读写缓冲、协议拆帧、协程等待点和关闭收敛
 
-- `src/common/rpc_error.h`
-  - 定义框架错误枚举与 `std::error_code` category
-  - 提供 protobuf 错误码与框架错误码的双向转换
+线程边界：
 
-- `src/common/thread_pool.*`
-  - 固定线程数最小线程池
-  - 提供 `Submit/Stop/Join`
-  - 提供基础统计：active workers、queue size、submitted/completed
+- `Connection` 只在 owner worker 线程访问
+- Acceptor 不直接操作连接状态，只投递 fd
+- 业务线程池不直接访问 `Connection`，处理结果通过 completed-response 队列回投 owner worker
 
-- `src/common/unique_fd.h`
-  - 提供 move-only 的 fd RAII 包装，避免手动 `close` 泄漏
+### Client
 
-- `src/common/log.h`
-  - 提供 `LogInfo/LogWarn/LogError`
-  - 自动附带 `file:line:function`（`std::source_location`）
+客户端维护长连接和 dispatcher 线程：
 
-- `src/demo/server_main.cpp`
-  - 注册 `CalcService.Add`
+- `Call`：同步调用，基于 `CallAsync().get()`
+- `CallAsync`：返回 `std::future<RpcCallResult>`
+- `CallCo`：返回 `Task<RpcCallResult>`，通过 coroutine waiter 直接绑定 pending slot
+- `PendingCalls`：维护 `request_id -> result slot`，支持 future waiter 与 coroutine waiter 共存
+- `EventLoop`：单连接 epoll wait，用于 dispatcher 线程监听可读事件和 wakeup
 
-- `src/demo/client_main.cpp`
-  - 调用 `Add(1,2)` 并输出结果
+### Client Pool
 
-## 4. 构建方法
+`RpcClientPool` 在多个 endpoint 上封装多个独立 `RpcClient`：
 
-### 依赖
+- 支持 `RoundRobin`
+- 支持 `LeastInflight`
+- 支持预热 `Warmup()`
+- 支持 endpoint stats
+- 同步 `Call` 支持连接类错误下自动重试其他健康节点
+- 异步与协程路径保持选择后转发，不做撤回式重试
 
-请先安装：
+### Thread Pool
 
+服务端业务线程池用于把耗时 handler 从 I/O worker 中卸载。
 
+当前线程池实现特点：
 
-- `cmake`
-- `g++`（支持 C++20）
-- `protobuf` 与 `protoc`
+- 固定 worker 数
+- 每个 worker 一个 bounded `MpscRingQueue`
+- producer 通过 CAS 申请槽位
+- consumer 批量 `PopBatch`
+- 使用 `pending` 原子计数提供统计快照
+- 提供 `Start / Submit / Stop / Join`
 
-示例（Debian/Ubuntu）：
+## Module Map
+
+```text
+proto/
+  rpc.proto                         通用 RPC envelope 与错误码
+  calc.proto                        CalcService demo 消息
+  user.proto                        UserService 示例消息
+
+src/protocol/
+  codec.*                           长度前缀协议编解码
+
+src/common/
+  unique_fd.h                       fd RAII
+  rpc_error.*                       统一错误码、Status、RpcException
+  async_logger.*                    异步日志
+  thread_pool.*                     业务线程池
+  mpsc_ring_queue.h                 MPSC ring queue
+
+src/client/
+  rpc_client.*                      单连接 RPC 客户端
+  pending_calls.*                   request_id 分发与 waiter 管理
+  event_loop.*                      客户端 dispatcher epoll loop
+  rpc_client_pool.*                 多 endpoint 客户端连接池
+  load_balancer.*                   RoundRobin / LeastInflight
+
+src/server/
+  rpc_server.*                      Acceptor 与服务端生命周期
+  worker_loop.*                     worker epoll loop
+  connection.*                      单连接协议、状态机、协程等待点
+  service_registry.*                服务注册与查找
+
+src/coroutine/
+  task.h                            C++20 Task 与 SyncWait
+
+src/demo/
+  server_main.cpp                   CalcService.Add 服务端 demo
+  client_main.cpp                   同步客户端 demo
+  coroutine_client_main.cpp         coroutine 客户端 demo
+```
+
+## Build
+
+### Requirements
+
+- Linux
+- CMake
+- g++ with C++20 support
+- Protobuf / protoc
+- pthread
+
+Ubuntu / Debian:
 
 ```bash
 sudo apt update
 sudo apt install -y cmake g++ protobuf-compiler libprotobuf-dev
 ```
 
-### 构建
+### Debug Build
 
 ```bash
-cd rpc_project
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug -j
 ```
 
-## 5. 运行 demo 步骤
-
-先启动服务端：
+### Release Build
 
 ```bash
-./build/rpc_server_demo
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j
 ```
 
-另开一个终端启动客户端：
+## Quick Start
+
+启动服务端：
 
 ```bash
-./build/rpc_client_demo
+./build-debug/rpc_server_demo
 ```
 
-预期客户端输出：
+另开终端运行同步客户端：
+
+```bash
+./build-debug/rpc_client_demo
+```
+
+预期输出：
 
 ```text
 Add(1,2) = 3
 ```
 
-## 6. RPC 调用流程说明
-
-1. 客户端将业务请求（`calc::AddRequest`）序列化为 `bytes payload`
-2. 客户端构造 `RpcRequest`：填入 `request_id/service_name/method_name/payload`
-3. `Codec` 发送数据：`[4字节长度][protobuf序列化后的RpcRequest]`
-4. 服务端读取并反序列化 `RpcRequest`
-5. 服务端通过 `ServiceRegistry` 查找 `CalcService.Add` handler
-6. handler 解析业务 payload，执行加法，返回响应 payload
-7. 服务端构造 `RpcResponse`（含错误码/错误信息）并回写
-8. 客户端读取 `RpcResponse`，成功时解析 `calc::AddResponse` 得到结果
-
-## 7. 错误体系与日志
-
-### 统一错误体系
-
-- 业务层可抛出 `RpcException`
-- 框架层统一收敛为 `Status`（包含 `std::error_code` 与 message）
-- 网络层响应仍使用 `rpc.proto` 中的 `ErrorCode` 字段，保证协议稳定
-
-### 日志
-
-- 日志接口：`LogInfo/LogWarn/LogError`
-- 每条日志自动输出来源位置：文件名、行号、函数名
-- 适合后续替换为更完整的日志后端（如 spdlog / tracing）
-
-## 8. 超时机制
-
-客户端提供基础超时配置（阻塞式最小实现）：
-
-- `send_timeout`：写请求超时
-- `recv_timeout`：读响应超时
-
-示例：
-
-```cpp
-rpc::client::RpcClient client(
-    "127.0.0.1", 50051,
-    {.send_timeout = std::chrono::milliseconds(1000),
-     .recv_timeout = std::chrono::milliseconds(1000)});
-```
-
-说明：当前版本基于 `SO_SNDTIMEO` / `SO_RCVTIMEO`，后续可升级到更细粒度的 per-request deadline。
-
-服务端连接级超时（新增）：
-
-- `Connection` 提供读/写 deadline（默认 5s）
-- 连接协程在等待可读/可写事件时会自动挂载对应 deadline
-- `RpcServer` 事件循环通过 tick 检查超时并触发连接收敛
-- 超时后连接进入 `Error`，并唤醒等待协程退出
-
-## 9. CallAsync（future-like 最小版本）
-
-客户端已提供最小异步接口：
-
-```cpp
-std::future<RpcCallResult> CallAsync(
-  std::string_view service_name,
-  std::string_view method_name,
-  std::string_view request_payload);
-```
-
-实现要点：
-
-- 复用当前 `request_id + PendingCalls + dispatcher` 主链路
-- `CallAsync` 负责发请求并返回 `future`
-- `CallAsync` 在 PendingCalls 注册 async 等待状态（promise + deadline）
-- dispatcher 的 event loop 收到可读事件后，解析响应并按 `request_id` 直接完成 promise
-- 同步 `Call` 改为 `CallAsync(...).get()`，保持现有调用行为
-
-定位说明：
-
-- 这是一个“最小可工作”过渡版，目标是在保持结构简单的前提下引入 reactor 思路
-- 当前结构已为后续 coroutine/awaitable 版本铺路（I/O readiness 与完成分发职责已分层）
-
-## 10. CallCo（direct coroutine waiter）
-
-客户端新增了 coroutine 友好接口：
-
-```cpp
-Task<RpcCallResult> CallCo(
-  std::string_view service_name,
-  std::string_view method_name,
-  std::string_view request_payload);
-```
-
-最小使用示例：
-
-```cpp
-rpc::coroutine::Task<void> Demo(rpc::client::RpcClient& client,
-                                const std::string& payload) {
-  auto result = co_await client.CallCo("CalcService", "Add", payload);
-  if (!result.ok()) {
-    co_return;
-  }
-  co_return;
-}
-```
-
-定位说明：
-
-- `CallCo` 直接走 `request_id + PendingCalls + dispatcher/event loop` 主链路
-- 协程在 `await_suspend` 阶段把句柄绑定到 pending slot
-- 响应到达后 dispatcher 通过 `Complete(request_id, ...)` 直接 `resume()` 对应协程
-- 超时与 `Close()` 失败收敛路径同样会恢复等待中的协程，避免永久挂起
-- 仍保持“小步演进”风格，不引入完整 coroutine runtime
-
-这一步相对“简单包装 CallAsync”的提升：
-
-- 去掉了 `future -> awaiter` 的桥接等待线程路径
-- 协程等待与 request_id 映射直接对齐，可读性和可调试性更好
-- 为后续 coroutine-driven runtime 与更强事件驱动奠定接口基础
-
-可运行示例：
+运行 coroutine 客户端：
 
 ```bash
-./build/rpc_coroutine_client_demo
+./build-debug/rpc_coroutine_client_demo
 ```
 
-## 11. 测试
+预期输出：
 
-本项目已提供 21 类可重复执行测试：
+```text
+[co] Add(1,2) = 3
+```
 
-- `event_loop_test`：event loop 基础行为
-  - 可读事件触发
-  - 超时返回
-  - wakeup 事件触发
+## Testing
 
-- `codec_test`：协议层
-  - 正常 encode/decode
-  - 长度为 0 的帧报错
-  - 超过最大帧长度报错
-  - protobuf 解析失败报错
-
-- `service_registry_test`：注册中心
-  - 注册成功
-  - 重复注册失败
-  - 未注册方法返回空
-  - 多线程并发注册/查找基础正确性
-
-- `e2e_test`：端到端
-  - Add(1,2)=3
-  - 不存在方法返回 `METHOD_NOT_FOUND`
-
-- `pending_calls_test`：pending 表
-  - Add/Complete/Pop 基本行为
-  - FailAll 行为
-  - 并发 Add/Complete/Pop 基础正确性
-
-- `out_of_order_dispatcher_test`：乱序响应分发
-  - 服务端故意按请求接收顺序的逆序返回响应
-  - 验证客户端 `CallAsync` 在乱序响应下通过 `request_id` 正确匹配结果
-  - 覆盖“连接关闭 + 已完成结果”竞态场景
-
-- `call_async_timeout_test`：异步超时隔离
-  - 多个 `CallAsync` 并发请求中，单个慢请求超时返回
-  - 验证其他请求仍可成功返回，不被超时请求污染
-
-- `call_async_close_test`：关闭连接后的异步收敛
-  - `Close()` 后未完成的 async future 必须收到失败结果
-  - 验证不会出现 future 永远不完成
-
-- `call_co_basic_test`：coroutine 调用基础成功
-  - `co_await client.CallCo(...)` 可获得正确结果
-  - 多个 coroutine 请求结果正确
-
-- `call_co_out_of_order_test`：coroutine 乱序响应分发
-  - 服务端逆序返回响应
-  - 验证 coroutine 调用仍按 request_id 正确匹配
-
-- `call_co_timeout_test`：coroutine 超时收敛
-  - 并发 coroutine 请求中慢请求超时
-  - 快请求结果不受影响
-
-- `call_co_close_test`：coroutine 连接关闭收敛
-  - `Close()` 后未完成 coroutine 调用返回失败结果
-
-- `call_mixed_waiters_test`：future 与 coroutine waiter 共存
-  - 同一连接并发混合 `CallAsync` 与 `CallCo`
-  - 服务端乱序返回响应，验证两种 waiter 均按 request_id 正确匹配
-  - 验证两条路径互不污染
-
-- `server_connection_test`：服务端 Connection + buffer 行为
-  - 单请求正常处理
-  - 半包输入可正确拼帧并处理
-  - 一次输入多 frame 可全部解析并返回
-  - 方法不存在返回 `METHOD_NOT_FOUND`
-  - handler 抛异常返回 `INTERNAL_ERROR`
-  - 非法请求 protobuf 返回 `PARSE_ERROR`
-
-- `server_connection_coroutine_test`：服务端连接协程雏形
-  - 协程主路径（读请求->处理->写响应）
-  - 半包输入挂起与恢复
-  - 写部分完成挂起与恢复
-  - 对端关闭收敛退出
-  - 读超时/写超时收敛退出
-  - 背压阈值触发时进入错误收敛
-
-- `server_worker_loop_test`：WorkerLoop 结构性验证
-  - 单 worker 初始化和连接接管
-  - WorkerLoop 驱动连接请求处理并返回响应
-  - 对端关闭后连接由 WorkerLoop 收敛清理
-
-- `server_multi_worker_loop_test`：多 worker 线程化验证
-  - worker 独立线程运行（Start/RequestStop/Join）
-  - acceptor 线程风格的跨线程连接投递与 worker 接管
-  - round-robin 风格分配下，多 worker 都能正确处理请求
-  - worker 停止时连接收敛关闭
-
-- `rpc_server_lifecycle_test`：服务端生命周期验证
-  - `RpcServer` 可启动并可 `Stop()`
-  - `Stop()` 后不再接收新连接
-  - `Call / CallAsync / CallCo` 在多 worker 服务端下行为正确
-  - 停止后客户端调用可预期失败，避免悬挂
-
-- `server_thread_pool_integration_test`：线程池解耦与竞态收敛验证
-  - `Call / CallAsync / CallCo` 在线程池模式下回归正确
-  - 慢 handler 并发场景响应不丢
-  - 连接关闭后后台完成结果可安全丢弃，不发生 UAF
-  - 校验 worker 与线程池的基础统计可用
-
-- `server_epoll_multi_connection_test`：单线程 epoll + 多连接驱动
-  - 多个 client 连接同时存在
-  - `Call` / `CallAsync` / `CallCo` 路径都可在 epoll 服务端下正常工作
-
-运行方式：
+列出测试：
 
 ```bash
-cd rpc_project
-cmake -S . -B build
-cmake --build build -j
-cd build
+cd build-debug
+ctest -N
+```
+
+运行全部测试：
+
+```bash
+cd build-debug
 ctest --output-on-failure
 ```
 
-仅运行乱序测试：
-
-```bash
-cd rpc_project/build
-ctest --output-on-failure -R 'out_of_order_dispatcher_test|call_async_timeout_test|call_async_close_test'
-```
-
-仅运行 coroutine 相关测试：
-
-```bash
-cd rpc_project/build
-ctest --output-on-failure -R 'call_co_basic_test|call_co_out_of_order_test|call_co_timeout_test|call_co_close_test'
-```
-
-## 12. Benchmark（性能评估）
-
-本节介绍 RPC 框架的性能评估工具与结果解读方法。
-
-### 12.1 Benchmark 概览
-
-本项目提供 5 个 benchmark 程序，用于评估 RPC 框架在不同场景下的性能：
-
-| 程序 | 定位 | 测什么 | 关注指标 |
-|------|------|--------|----------|
-| `rpc_benchmark` | 基础延迟与吞吐 | 单连接 baseline | QPS, avg, p95, p99 |
-| `rpc_benchmark_pipeline` | 单连接 pipeline | 单连接多 in-flight 能力 | QPS 提升, p95/p99 上升 |
-| `rpc_benchmark_conn_pool` | Manual Multi-Client | 多长连接 × 每连接多 in-flight | QPS, tail latency |
-| `rpc_client_pool_benchmark` | RpcClientPool | RoundRobin/LeastInflight/Failover | 分发比例, health |
-| `rpc_thread_pool_benchmark` | 线程池效果 | inline vs business thread pool | speedup ratio |
-
-> **说明**：所有 benchmark 均显式关闭 heartbeat（`heartbeat_interval=0`），避免后台 tick、心跳请求和心跳日志污染 QPS/latency 结果。
-
-### 12.2 RpcClient 长连接说明
-
-`RpcClient` 使用 **lazy connect + persistent connection** 模型：
-
-- 第一次调用 `Connect()` 建立 TCP 连接
-- 如果 `sock_` 已存在，后续 `Connect()` 直接返回 true
-- 后续 `Call / CallAsync / CallCo` 复用同一条 TCP 连接
-- 通过 `request_id` 支持同一连接上的多个 in-flight 请求
-
-这意味着：
-- 单个 `RpcClient` 可以通过 pipeline 方式发送多个 in-flight 请求
-- `rpc_benchmark_conn_pool` 手动创建多个 `RpcClient`，每个独占一条长连接
-- `rpc_client_pool_benchmark` 使用 `RpcClientPool` 统一管理多个 endpoint
-
-### 12.3 如何运行 Benchmark
-
-#### 构建项目
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-#### 运行全部 benchmark（推荐）
-
-```bash
-./scripts/run_benchmarks.sh build
-```
-
-这会自动运行推荐的 benchmark 组合：
-- A. baseline: `rpc_benchmark` (sync, 1k 请求)
-- B. pipeline: `rpc_benchmark_pipeline` (多 depth 扫描)
-- C. conn_pool: `rpc_benchmark_conn_pool` (多连接 × 多 depth)
-- D. thread_pool: `rpc_thread_pool_benchmark` (inline vs pool 对比)
-
-结果保存到 `benchmarks/results/` 目录。
-
-#### 单独运行某个 benchmark
-
-```bash
-# Baseline benchmark
-./build/rpc_benchmark --mode=sync --requests=5000 --concurrency=8
-
-# Pipeline benchmark (单 depth)
-./build/rpc_benchmark_pipeline --requests=50000 --depth=32
-
-# Connection pool benchmark (单测点)
-./build/rpc_benchmark_conn_pool --requests=100000 --conns=4 --depth=32
-
-# Thread pool benchmark
-./build/rpc_thread_pool_benchmark 128 16 20
-```
-
-#### 生成 Markdown 汇总
-
-```bash
-python3 scripts/summarize_benchmarks.py
-```
-
-输出 `benchmarks/results/summary.md`，包含所有结果的表格。
-
-### 12.4 指标说明
-
-#### QPS（Queries Per Second）
-
-```
-QPS = success_count / elapsed_seconds
-```
-
-注意：
-- 只用成功请求计算 QPS
-- 如果 `failed_count` 或 `timeout_count` 不为 0，结果需要谨慎解释
-- `failed_count > 0` 时这组数据不能直接说明吞吐能力
-
-#### Latency（延迟）
-
-- **avg**: 所有成功请求的平均端到端延迟（微秒）
-- **p50**: 50% 请求的延迟不超过此值
-- **p95/p99**: 95%/99% 请求的延迟不超过此值，反映尾延迟
-
-#### Connections / Depth
-
-- **connections**: 客户端并发连接数
-- **depth**: 每连接 in-flight（未完成）请求数
-
-### 12.5 每个 Benchmark 详解
-
-#### rpc_benchmark（基础延迟与吞吐）
-
-定位：baseline benchmark，测最基础的 RPC 调用延迟和吞吐。
-
-模型：
-- 启动内嵌服务端
-- 创建 N 个并发 client 线程
-- 每个线程使用 sync/async/coroutine 模式调用
-- 测量端到端延迟和 QPS
-
-参数：
-- `--mode=sync|async|co`: 调用模式（默认 sync）
-- `--requests=N`: 总请求数（默认 10000）
-- `--concurrency=N`: 客户端线程数（默认 8）
-- `--payload_bytes=N`: payload 大小（默认 128）
-
-```
-./build/rpc_benchmark --mode=sync --requests=5000 --concurrency=8
-```
-
-#### rpc_benchmark_pipeline（单连接多 in-flight）
-
-定位：测 `CallAsync + PendingCalls + request_id` 分发的价值。
-
-模型：
-- 单个 RpcClient，单条连接
-- 使用 CallAsync() 环形 pipeline 发请求
-- 控制 in-flight 窗口大小
-- 重点观察 depth 提高后 QPS 是否提升，p95/p99 是否上升
-
-参数：
-- `--requests=N`: 总请求数（默认 50000）
-- `--depth=N`: pipeline depth（默认自动扫描 1,8,32,64,128,256）
-- `--payload_bytes=N`: payload 大小（默认 64）
-
-```
-./build/rpc_benchmark_pipeline --requests=50000 --depth=32
-```
-
-#### rpc_benchmark_conn_pool（多连接吞吐上限）
-
-定位：测单连接是否成为瓶颈，多连接能否进一步提高吞吐。
-
-模型：
-- 创建 N 个 RpcClient，每个独占一条 TCP 连接
-- 每个连接使用 CallAsync() 环形 pipeline 发请求
-- 每连接 in-flight 深度固定
-- 总并发 = 连接数 × 每连接深度
-
-参数：
-- `--requests=N`: 总请求数（默认 50000）
-- `--conns=N`: 连接数（默认自动扫描 1,4,8,16）
-- `--depth=N`: 每连接 pipeline depth（默认自动扫描 8,16,32）
-
-```
-./build/rpc_benchmark_conn_pool --requests=100000 --conns=4 --depth=32
-```
-
-#### rpc_thread_pool_benchmark（线程池效果）
-
-定位：观察业务线程池是否能避免 I/O worker 被慢 handler 拖住。
-
-模型：
-- 场景 A：`business_thread_count=0`（inline handler，handler 在 worker 线程执行）
-- 场景 B：`business_thread_count=4`（thread pool handler，handler 在业务线程池执行）
-- 服务端 handler 模拟 sleep 延迟
-- 测量两种模式下的 QPS / avg / p95 / p99
-
-参数（位置参数）：
-- argv[1]: 总请求数（默认 128）
-- argv[2]: 并发客户端数（默认 16）
-- argv[3]: handler sleep 毫秒数（默认 20）
-
-```
-./build/rpc_thread_pool_benchmark 128 16 20
-```
-
-输出包含两种模式的统计以及 `qps_speedup`（thread pool QPS / inline QPS）。
-
-#### rpc_client_pool_benchmark（RpcClientPool 负载均衡）
-
-定位：展示 `RpcClientPool` 负载均衡模块的作用，重点观察分发比例、健康状态、故障转移。
-
-模型：
-- 启动多个 endpoint server
-- 创建 `RpcClientPool` 配置 RoundRobin / LeastInflight 策略
-- 多线程并发发送请求
-- 观察 endpoint 分发比例和健康状态
-
-场景：
-
-1. **round_robin**：展示 RoundRobin 分发到 3 个 endpoint
-2. **least_inflight**：展示 LeastInflight 在有慢节点时的倾向避让
-3. **failover**：展示故障转移和健康检查
-
-参数：
-- `--scenario=round_robin|least_inflight|failover`: 场景选择（默认 round_robin）
-- `--requests=N`: 总请求数（默认 30000）
-- `--payload_bytes=N`: payload 大小（默认 64）
-- `--concurrency=N`: 并发数（默认 8）
-
-```
-# RoundRobin 分发
-./build/rpc_client_pool_benchmark --scenario=round_robin --requests=30000 --payload_bytes=64
-
-# LeastInflight 倾向避让
-./build/rpc_client_pool_benchmark --scenario=least_inflight --requests=30000 --payload_bytes=64
-
-# Failover 故障转移
-./build/rpc_client_pool_benchmark --scenario=failover --requests=1000 --payload_bytes=64
-```
-
-输出示例：
-```
-=== RpcClientPool Benchmark: round_robin ===
-requests=30000 payload=64 bytes
-
-QPS=...
-Avg(us)=...
-P95(us)=...
-P99(us)=...
-
-Endpoint stats:
-endpoint              select  success  fail  inflight  healthy
-127.0.0.1:50301       10000   10000    0     0         true
-127.0.0.1:50302       10000   10000    0     0         true
-127.0.0.1:50303       10000   10000    0     0         true
-
-Distribution:
-  127.0.0.1:50301: 33.3%
-  127.0.0.1:50302: 33.3%
-  127.0.0.1:50303: 33.3%
-```
-
-### 12.6 理解 Benchmark 结果
-
-#### 关注什么
-
-1. **QPS 是成功请求吞吐**：只统计成功请求，失败/超时请求不计入
-2. **avg latency 是平均延迟**：所有成功请求的平均值
-3. **p95/p99 是尾延迟**：反映长尾请求的延迟
-4. **failed_count > 0 时结果需要谨慎解释**：这组数据不能直接说明吞吐能力
-
-#### 常见问题
-
-1. **`depth` 提高后 QPS 提升但 p95/p99 也上升**：
-   - 这是正常的，pipeline 深度增加会提高吞吐但也会增加排队延迟
-   - 需要在吞吐和尾延迟之间做权衡
-
-2. **增加 connections 后 QPS 提升不明显**：
-   - 可能是服务端成了瓶颈（worker 数、线程池数不够）
-   - 可能是网络带宽限制
-
-3. **inline vs thread pool speedup < 1x**：
-   - 可能是 handler 太轻量（sleep 不足以体现线程池价值）
-   - 可能是并发太低（线程池优势需要一定并发量才能体现）
-
-### 12.7 测试环境说明模板
-
-运行 benchmark 前，建议记录环境信息，方便复现和对比：
+当前测试覆盖 22 个目标：
 
 ```text
-Environment:
-- CPU: <your_cpu_info>
-- OS: <your_os_version>
-- Compiler: <g++ --version>
-- Build type: Release
-- Protobuf: <version>
-- Server workers: <num>
-- Payload: <size> bytes
+event_loop_test
+codec_test
+service_registry_test
+e2e_test
+out_of_order_dispatcher_test
+call_async_timeout_test
+call_async_close_test
+call_co_basic_test
+call_co_out_of_order_test
+call_co_timeout_test
+call_co_close_test
+call_mixed_waiters_test
+pending_calls_test
+call_co_edge_cases_test
+server_connection_test
+server_connection_coroutine_test
+server_worker_loop_test
+server_multi_connection_test
+server_multi_worker_loop_test
+server_thread_pool_integration_test
+heartbeat_test
+rpc_client_pool_test
 ```
 
-### 12.8 输出文件说明
+最近一次验证：
 
-每次 benchmark 运行会产生独立的 timestamp 目录：
-
-```
-benchmarks/results/
-├── run_YYYYMMDD_HHMMSS/          # 每次运行的独立目录
-│   ├── baseline/                 # Baseline 结果
-│   │   └── rpc_benchmark_*.csv
-│   ├── pipeline/                 # Pipeline 结果
-│   │   └── rpc_benchmark_pipeline_*.csv
-│   ├── conn_pool/                # Connection pool 结果
-│   │   └── rpc_benchmark_conn_pool_*.csv
-│   ├── thread_pool/              # Thread pool 结果
-│   │   └── rpc_thread_pool_benchmark_*.csv
-│   └── summary.md                # Markdown 汇总（自动生成）
-└── ...
+```text
+build-debug: 22/22 tests passed
 ```
 
-查看完整结果：
+## Benchmarks
+
+推荐使用 Release 构建运行 benchmark：
 
 ```bash
-# 查看最近一次运行的汇总
-cat benchmarks/results/run_*/summary.md
-
-# 查看原始 CSV
-ls benchmarks/results/run_YYYYMMDD_HHMMSS/baseline/
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j
+LOG_LEVEL=off ./scripts/run_benchmarks.sh build-release
 ```
 
-+++++++
-REPLACE
-## 13. 客户端连接池与负载均衡（新增）
+脚本会运行：
 
-### 13.1 设计目标
+- `rpc_benchmark`：基础 sync/async/co latency 与 QPS
+- `rpc_benchmark_pipeline`：单连接多 in-flight pipeline
+- `rpc_benchmark_conn_pool`：多连接 × 每连接 depth
+- `rpc_client_pool_benchmark`：RoundRobin / LeastInflight 分发策略
+- `rpc_thread_pool_benchmark`：inline handler vs business thread pool
+- `thread_pool_benchmark`：ThreadPool 架构 microbenchmark
 
-在现有单连接 `RpcClient` 基础上，增量增强为多 endpoint 客户端连接池，不推翻 `Call / CallAsync / CallCo` 主链路，对外保持一致的调用风格。
+结果写入 `benchmarks/results/run_YYYYMMDD_HHMMSS/`，包含 CSV/TXT + 自动生成的 `summary.md`。
 
-### 13.2 核心组件
+### 代表性结果 (Release -O3, 4-core Xeon Gold 6254, loopback, log=off)
 
-- `src/client/load_balancer.*`
-  - `LoadBalancer`：策略基类，负责从 healthy 候选节点中选择一个
-  - `RoundRobinBalancer`：原子计数器实现无锁轮询
-  - `LeastInflightBalancer`：实时比较各节点 `GetInflightCount()`，选最小者
+| Benchmark | 关键指标 |
+|-----------|---------|
+| Baseline sync RPC | p50 ≈ 70-100us, QPS ≈ 40k (1000 req, 并发 8) |
+| Pipeline depth=64 | QPS ≈ 51k, p99 ≈ 42ms (50k req, 单连接) |
+| Conn Pool 8×32 | QPS ≈ 71k, p99 ≈ 45ms |
+| ClientPool RoundRobin | 分发均匀 (33.3%/endpoint), QPS ≈ 68k |
+| ClientPool LeastInflight | fast:slow ≈ 95:5 分发偏快节点, QPS ≈ 24k |
+| ThreadPool E2E (20ms sleep) | inline → pool: QPS 翻倍, p95 从 221ms → 80ms |
+| ThreadPool microbench (4w×32p) | p50: 12ms → 120us (100x), QPS 1.8x |
 
-- `src/client/rpc_client_pool.*`
-  - `RpcClientPool`：持有多个 `RpcClient`（每个 endpoint 独占一个）
-  - 支持 `Call`（同步，含自动重试）、`CallAsync`（异步）、`CallCo`（协程）
-  - 最小健康检查：连续失败超阈值后标记 unhealthy，剔除出候选集
-  - 运行时统计：`inflight`、`success/fail count`、`select_count`、`healthy`、`connected`
-
-### 13.3 使用示例
-
-```cpp
-rpc::client::RpcClientPool pool(
-    {{"127.0.0.1", 50051},
-     {"127.0.0.1", 50052},
-     {"127.0.0.1", 50053}},
-    rpc::client::RpcClientPoolOptions{
-        .client_options =
-            rpc::client::RpcClientOptions{
-                .send_timeout = std::chrono::milliseconds(1000),
-                .recv_timeout = std::chrono::milliseconds(1000)},
-        .strategy = rpc::client::LoadBalanceStrategy::kLeastInflight,
-        .max_consecutive_failures = 3});
-
-// 预热（可选）
-pool.Warmup();
-
-// 同步调用（自动重试）
-auto result = pool.Call("CalcService", "Add", payload);
-
-// 异步调用
-auto future = pool.CallAsync("CalcService", "Add", payload);
-
-// 协程调用
-auto task = pool.CallCo("CalcService", "Add", payload);
-```
-
-### 13.4 线程安全
-
-- `SelectChannel`、`Call`、`CallAsync`、`CallCo` 均可多线程并发调用
-- 各 channel 统计使用原子变量，健康状态使用原子 bool
-- `RoundRobin` 使用 `fetch_add` 实现无锁轮询
-- `LeastInflight` 读取各节点 `GetInflightCount()`（内部也是原子操作）
-
-### 13.5 设计取舍
-
-1. **不复用连接**：每个 endpoint 独占 `RpcClient`，保持简单，不引入共享连接的复杂状态机。
-2. **不重写 RpcClient**：Pool 只做"选择 + 转发"，复用现有 `Call/CallAsync/CallCo` 链路。
-3. **异步/协程路径不重试**：`future`/`Task` 已发出后难以安全撤回，重试由同步 `Call` 承担。
-4. **inflight 精确统计**：直接透传 `RpcClient::GetInflightCount()`，避免 Pool 层自行维护的误差。
-5. **最小健康检查**：仅基于连续失败计数，不做复杂熔断（如滑动窗口、半开状态）。
-
-### 13.6 新增测试
-
-- `rpc_client_pool_test`
-  - RoundRobin 多 endpoint 分发正确
-  - LeastInflight 倾向选择负载轻的连接
-  - 某个 endpoint 挂掉时自动故障转移
-  - `CallAsync` / `CallCo` 在 pool 模式下仍正确工作
-  - 乱序响应不会污染其它 endpoint 的结果匹配
-
-运行：
+### 单独运行示例
 
 ```bash
-cd rpc_project/build
-./rpc_client_pool_test
+./build-release/rpc_benchmark --mode=sync --requests=5000 --concurrency=8 --log=off
+./build-release/rpc_benchmark_pipeline --requests=50000 --depth=32 --payload_bytes=64 --log=off
+./build-release/rpc_benchmark_conn_pool --requests=100000 --conns=8 --depth=32 --payload_bytes=64 --log=off
+./build-release/rpc_client_pool_benchmark --scenario=least_inflight --requests=50000 --payload_bytes=64 --concurrency=8 --output_dir=benchmarks/results/tmp
+./build-release/rpc_thread_pool_benchmark 1024 16 20 benchmarks/results/tmp
 ```
 
-## 14. 可扩展性说明
+> **注意**: 以上为单机 loopback 数据，不等同网络场景。详细信息见 `benchmarks/results/run_*/summary.md`。
 
-当前版本不是生产级 RPC 框架，定位是“可运行、可讲清楚、可继续演进”的工程化样例：
-- 保留当前多 WorkerLoop + Connection coroutine 主路径
-- 增加最小业务线程池与 owner-worker 回投，不做大规模 runtime 改造
-- 保持客户端 `Call/CallAsync/CallCo` 路径不变
+## Reliability Scenarios Covered
 
-这次明确不做：
-- io_uring 改造
-- 外部系统依赖（Redis/数据库/外部队列）
-- 复杂任务系统（work stealing、优先级队列、复杂取消框架）
+测试覆盖的关键场景包括：
 
-后续可继续做深但本次不做：
-1. 请求级并发调度与更细粒度取消
-2. 更完整的 graceful shutdown（请求截止时间、分阶段 drain 策略）
-3. 更强 metrics/tracing（指标导出与链路观测）
-4. 连接池与客户端负载均衡
-5. benchmark 场景深化（更多 payload 分布与多机对比）
+- TCP 半包、多包、非法 frame
+- protobuf 解析失败
+- 未注册方法返回 `METHOD_NOT_FOUND`
+- handler 抛异常返回 `INTERNAL_ERROR`
+- 多 in-flight 请求乱序响应匹配
+- `CallAsync` 超时隔离
+- `CallAsync` 连接关闭收敛
+- `CallCo` 正常、超时、关闭、乱序响应
+- future waiter 与 coroutine waiter 混合
+- server connection coroutine 读写挂起/恢复
+- WorkerLoop 跨线程连接投递
+- 多 worker 分发
+- 服务端业务线程池回投
+- 心跳检测
+- 客户端连接池负载均衡、失败剔除与重试
+
+## Roadmap
+
+- 增加 CI：Debug / Release / CTest / Sanitizer
+- 增加 ASan、UBSan、TSan 专项测试入口
+- [x] 补充更完整的 benchmark 结果表格和机器配置 → `benchmarks/results/run_20260430_112749/`
+- 增加更细粒度 per-request cancellation
+- 增加 backpressure 策略和队列满时的可配置行为
+- 增加 TLS / 鉴权 / 服务发现等生产化能力
+- 评估 io_uring 版本 I/O backend
+
+## Limitations
+
+这个项目当前定位是 C++ 后端与基础架构方向的工程实践，不是完整生产级 RPC 框架。
+
+当前尚未包含：
+
+- TLS 加密与认证授权
+- 服务发现、注册中心、配置中心
+- 跨进程 tracing / metrics 导出
+- 自动 IDL 代码生成框架
+- 多协议兼容
+- 完整流式 RPC
+- 跨平台网络抽象
+
+## Resume Keywords
+
+适合在简历中概括为：
+
+```text
+基于 C++20 / Linux epoll / Protobuf 实现轻量级 RPC 框架，支持同步、future 异步与 coroutine 调用；服务端采用 Acceptor + 多 WorkerLoop 架构，连接绑定 owner worker；实现 request_id 分发、连接池、负载均衡、心跳检测、超时收敛、业务线程池和 benchmark suite，并通过 22 个自动化测试覆盖并发与生命周期场景。
+```
