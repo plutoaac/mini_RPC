@@ -514,9 +514,10 @@ RpcClient::Close()
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              PendingCalls                                   │
 │                                                                             │
-│  slots_: unordered_map<string, Slot>                                       │
+│  slots_: unordered_map<string, Slot, StringHash, StringEqual>              │
+│           ↑ 透明查找 (is_transparent): string_view 直接 find，免临时分配   │
 │                                                                             │
-│  Slot {                                                                    │
+│  Slot {                                                                     │
 │    done: bool                                                              │
 │    result: RpcCallResult                                                   │
 │    cv: condition_variable                                                  │

@@ -318,15 +318,19 @@
 
 | 组件                | 职责                                   | 关键方法                        |
 | ------------------- | -------------------------------------- | ------------------------------- |
-| **RpcServer**       | 服务器生命周期管理，epoll 事件循环     | `Start()`                       |
-| **Connection**      | 单个客户端连接处理，协议解析，请求路由 | `OnReadable()`, `OnWritable()`  |
+| **RpcServer**       | 服务器生命周期管理，acceptor 事件循环  | `Start()`                       |
+| **WorkerLoop**      | Worker 线程 epoll 循环，协程/线程池协调| `PollOnce()`, `DispatchRequestToThreadPool()` |
+| **Connection**      | 单连接协议解析，双游标读缓冲，分片写缓冲| `OnReadable()`, `OnWritable()`  |
 | **ServiceRegistry** | 服务方法注册与查找，线程安全           | `Register()`, `Find()`          |
+| **ThreadPool**      | 业务线程池，per-worker MpscRingQueue   | `Submit()`, `Stop()`, `Join()`  |
 
 ## 10. 设计特点
 
-1. **单线程 epoll 事件驱动**: 高效处理多连接，无需多线程
-2. **非阻塞 I/O**: 所有 socket 操作都是非阻塞的
-3. **RAII 资源管理**: `UniqueFd` 自动管理 socket 生命周期
-4. **简洁的帧协议**: 4字节大端序长度前缀 + Protobuf 序列化
-5. **线程安全注册表**: `ServiceRegistry` 支持并发注册和查找
-6. **动态事件注册**: 根据写缓冲区状态动态调整 EPOLLOUT 事件
+1. **Acceptor + WorkerLoop 分层**：Acceptor 只 accept + 分发，Worker one-loop-per-thread 驱动连接
+2. **C++20 协程驱动**：每连接一个 `HandleConnectionCo` 协程，epoll 事件驱动挂起/恢复
+3. **业务线程池 + owner-worker 回投**：慢 handler 从 I/O worker 解耦，通过 `CompletedQueue` + eventfd 唤醒
+4. **双游标 Buffer**：读路径 `read_index`/`write_index` 避免 O(N) memmove
+5. **分片写缓冲**：`deque<PendingChunk>` + `pending_write_bytes_` O(1) 背压
+6. **无锁 MPSC 任务队列**：ThreadPool 每 worker 独占 MpscRingQueue，CAS 入队，批量出队
+7. **RAII 资源管理**：`UniqueFd` 自动管理 socket 生命周期
+8. **动态事件注册**：根据写缓冲区状态动态调整 EPOLLOUT 事件

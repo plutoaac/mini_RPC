@@ -51,6 +51,12 @@
 │   Thread 0        Thread 1        Thread 2        Thread 3                 │
 │   [handler]       [handler]       [handler]       [handler]                │
 │                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                    per-worker MpscRingQueue                           │   │
+│  │                  (无锁环形队列, 定容 1024)                            │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  多生产者 CAS 入队 → 单消费者 PopBatch 批量出队                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -274,7 +280,7 @@ HandleConnectionCo(connection, coroutine_ok, coroutine_error)
 
 ## 6. 线程池模式请求处理
 
-### 6.1 请求分发到线程池
+### 6.1 请求分发到线程池 (MpscRingQueue 优化版)
 
 ```
 Connection::TryParseRequests()
@@ -289,7 +295,13 @@ Connection::TryParseRequests()
             │                       │
             │                       ├── thread_pool_->Submit([lambda])
             │                       │       │
-            │                       │       └── [业务线程执行]
+            │                       │       │  ┌──────────────────────────┐
+            │                       │       │  │ MpscRingQueue (per-worker)│
+            │                       │       │  │ 多生产者 CAS 抢槽位       │
+            │                       │       │  │ sequence 三态: 空闲→发布→消费│
+            │                       │       │  └──────────────────────────┘
+            │                       │       │
+            │                       │       └── [业务线程 PopBatch 批量取出后执行]
             │                       │               │
             │                       │               ├── 查找 handler
             │                       │               │
@@ -454,11 +466,14 @@ RpcServer::Stop()
                                       │ 持有
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                                 Connection                                  │
+│                                Connection                                  │
 │                                                                             │
 │  fd_: UniqueFd                                                             │
-│  read_buffer_: string                                                      │
-│  write_buffer_: string                                                     │
+│  read_buffer_: Buffer (双游标: read_index / write_index)                   │
+│  write_buffer_: std::deque<PendingChunk> (分片队列)                        │
+│  pending_write_bytes_: size_t (O(1) 背压检查)                              │
+│  read_waiter_: coroutine_handle (挂起的读协程)                             │
+│  write_waiter_: coroutine_handle (挂起的写协程)                            │
 │  request_dispatcher_: function<...>  (可选，指向 WorkerLoop 方法)          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -490,12 +505,13 @@ RpcServer::Stop()
 │           ▼                   ▼                     ▼                      │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │                      Business Thread Pool                            │  │
+│  │         (per-worker MpscRingQueue, 无锁 CAS 入队 + 批量出队)        │  │
 │  │                                                                      │  │
 │  │   Thread 0      Thread 1      Thread 2      Thread 3               │  │
 │  │   [handler]     [handler]     [handler]     [handler]              │  │
 │  │                                                                      │  │
 │  │   执行用户注册的业务方法                                            │  │
-│  │   完成后将结果写入 completed_queue_                                 │  │
+│  │   完成后将 CompletedResponse 回投 completed_queue_                  │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
