@@ -27,8 +27,6 @@
  *    - 与事件循环配合实现非阻塞异步 I/O
  *
  * @see connection.h 头文件定义
- * @author RPC Framework Team
- * @date 2024
  */
 
 #include "server/connection.h"

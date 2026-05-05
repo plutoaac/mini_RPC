@@ -81,8 +81,8 @@ class ThreadPool {
   std::vector<std::thread> workers_;
 
   // 原子状态标志
-  std::atomic<bool> accepting_tasks_{false};
-  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> accepting_tasks_{false};//是否接收新任务
+  std::atomic<bool> stop_requested_{false};//是否请求停止
 
   // 原子统计计数器
   alignas(64) std::atomic<std::size_t> active_workers_{0};

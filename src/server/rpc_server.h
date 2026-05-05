@@ -65,8 +65,6 @@
  *
  * @see Connection 处理单个客户端连接
  * @see ServiceRegistry 服务方法注册表
- * @author RPC Framework Team
- * @date 2024
  */
 
 #pragma once

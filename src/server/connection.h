@@ -68,8 +68,6 @@
  *
  * @see RpcServer 管理 Connection 的生命周期
  * @see ServiceRegistry 提供方法查找功能
- * @author RPC Framework Team
- * @date 2024
  */
 
 #pragma once

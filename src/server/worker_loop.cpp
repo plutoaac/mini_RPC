@@ -30,8 +30,6 @@
  * WorkerLoop 是多线程版本，连接分布到多个工作线程。
  *
  * @see worker_loop.h 头文件定义
- * @author RPC Framework Team
- * @date 2024
  */
 
 #include "server/worker_loop.h"

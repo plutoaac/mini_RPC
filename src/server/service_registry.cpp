@@ -13,7 +13,6 @@
  * - 返回引用包装器避免不必要的复制
  *
  * @see service_registry.h 头文件定义
- * @author RPC Framework Team
  */
 
 #include "server/service_registry.h"
