@@ -6,8 +6,24 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_program(SYSTEM_PROTOC protoc
+    PATHS /usr/bin /usr/local/bin
+    NO_DEFAULT_PATH
+)
+if(SYSTEM_PROTOC)
+    set(Protobuf_PROTOC_EXECUTABLE "${SYSTEM_PROTOC}" CACHE FILEPATH
+        "protoc executable used by protobuf_generate_cpp" FORCE)
+endif()
+
 find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
+find_package(nlohmann_json 3.10 QUIET)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    add_library(nlohmann_json_fallback INTERFACE)
+    target_include_directories(nlohmann_json_fallback INTERFACE /usr/include)
+    add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json_fallback)
+endif()
+find_package(SQLite3 REQUIRED)
 include(CTest)
 
 message(STATUS "Using Protobuf ${Protobuf_VERSION}")
@@ -38,6 +54,46 @@ add_library(rpc_framework
     src/client/rpc_client_pool.cpp
 )
 
+# codegraph-cpp integration (optional, for native backend)
+set(CODEGRAPH_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../codegraph-cpp" CACHE PATH
+    "Path to codegraph-cpp project root")
+if(EXISTS "${CODEGRAPH_CPP_DIR}/include")
+    set(HAS_CODEGRAPH_CPP TRUE)
+    message(STATUS "codegraph-cpp found at ${CODEGRAPH_CPP_DIR}")
+else()
+    set(HAS_CODEGRAPH_CPP FALSE)
+    message(STATUS "codegraph-cpp not found, native backend disabled")
+endif()
+
+add_library(codegraph_mcp_bridge
+    src/codegraph/codegraph_rpc_service.cpp
+    src/codegraph/sqlite_codegraph_backend.cpp
+    src/codegraph/mcp_adapter.cpp
+    $<$<BOOL:${HAS_CODEGRAPH_CPP}>:src/codegraph/codegraph_native_backend.cpp>
+)
+
+if(HAS_CODEGRAPH_CPP)
+    target_include_directories(codegraph_mcp_bridge
+        PUBLIC ${CODEGRAPH_CPP_DIR}/include
+    )
+    # Link codegraph_core static library (built by codegraph-cpp)
+    find_library(CODEGRAPH_CORE_LIB codegraph_core
+        PATHS "${CODEGRAPH_CPP_DIR}/build"
+        NO_DEFAULT_PATH
+    )
+    if(CODEGRAPH_CORE_LIB)
+        target_link_libraries(codegraph_mcp_bridge
+            PUBLIC ${CODEGRAPH_CORE_LIB}
+        )
+        target_compile_definitions(codegraph_mcp_bridge
+            PUBLIC HAS_CODEGRAPH_CPP=1
+        )
+    else()
+        message(WARNING "codegraph_core library not found at ${CODEGRAPH_CPP_DIR}/build. "
+                        "Build codegraph-cpp first: cd ${CODEGRAPH_CPP_DIR}/build && cmake .. && make")
+    endif()
+endif()
+
 target_include_directories(rpc_framework
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -49,6 +105,13 @@ target_link_libraries(rpc_framework
     PUBLIC
         ${Protobuf_LIBRARIES}
     Threads::Threads
+)
+
+target_link_libraries(codegraph_mcp_bridge
+    PUBLIC
+        rpc_framework
+        nlohmann_json::nlohmann_json
+        SQLite::SQLite3
 )
 
 add_executable(rpc_server_demo
@@ -76,6 +139,24 @@ add_executable(rpc_coroutine_client_demo
 target_link_libraries(rpc_coroutine_client_demo
     PRIVATE
         rpc_framework
+)
+
+add_executable(codegraph_rpc_server_demo
+    src/demo/codegraph_rpc_server_main.cpp
+)
+
+target_link_libraries(codegraph_rpc_server_demo
+    PRIVATE
+        codegraph_mcp_bridge
+)
+
+add_executable(codegraph_mcp_adapter_demo
+    src/demo/codegraph_mcp_adapter_main.cpp
+)
+
+target_link_libraries(codegraph_mcp_adapter_demo
+    PRIVATE
+        codegraph_mcp_bridge
 )
 
 if(BUILD_TESTING)
@@ -126,6 +207,32 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME e2e_test COMMAND e2e_test)
+
+    add_executable(codegraph_mcp_rpc_test
+        tests/codegraph_mcp_rpc_test.cpp
+    )
+
+    target_link_libraries(codegraph_mcp_rpc_test
+        PRIVATE
+            codegraph_mcp_bridge
+            Threads::Threads
+    )
+
+    add_test(NAME codegraph_mcp_rpc_test COMMAND codegraph_mcp_rpc_test)
+
+    if(HAS_CODEGRAPH_CPP AND CODEGRAPH_CORE_LIB)
+        add_executable(codegraph_native_backend_test
+            tests/codegraph_native_backend_test.cpp
+        )
+
+        target_link_libraries(codegraph_native_backend_test
+            PRIVATE
+                codegraph_mcp_bridge
+                Threads::Threads
+        )
+
+        add_test(NAME codegraph_native_backend_test COMMAND codegraph_native_backend_test)
+    endif()
 
     add_executable(out_of_order_dispatcher_test
         tests/out_of_order_dispatcher_test.cpp
