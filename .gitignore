@@ -28,3 +28,10 @@ Testing/
 *.vscode/
 compile_commands.json
 
+
+# CodeGraph index
+.codegraph/
+
+# Interview preparation (private)
+docs/interview_*
+docs/callco_coroutine_flow.md
